@@ -34,11 +34,28 @@
 #define MSR_VM_CR_SVM_DIS_BIT     0x4
 #define MSR_EFER_SVM_EN_ADDR      0xc0000080
 #define MSR_EFER_SVM_EN_BIT       0x12
+#define MSR_VM_HSAVE_PA           0xc0010117
 
 #define INSTR_SVM_VMRUN           ".byte 0x0f, 0x01, 0xd8"
 #define INSTR_SVM_VMMCALL         ".byte 0x0f, 0x01, 0xd9"
 #define INSTR_SVM_STGI            ".byte 0x0f, 0x01, 0xdc"
 #define INSTR_SVM_CLGI            ".byte 0x0f, 0x01, 0xdd"
+
+struct svm_cpu_data {
+	int cpu;
+	u64 asid_generation;
+	u32 max_asid;
+	u32 next_asid;
+	struct page *save_area;
+};
+
+struct vcpu_svm {
+	int cpu;
+	struct vmcb *vmcb;
+	unsigned long vmcb_pa;
+	struct svm_cpu_data *svm_data;
+	uint64_t asid_generation;
+};
 
 //
 // =====================================

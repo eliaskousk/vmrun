@@ -25,6 +25,8 @@
 #ifndef VMRUN_H
 #define VMRUN_H
 
+#define NR_VCPUS 2
+
 #define CPUID_EXT_1_SVM_LEAF      0x80000001
 #define CPUID_EXT_1_SVM_BIT       0x2
 #define CPUID_EXT_A_SVM_LOCK_LEAF 0x8000000a
@@ -41,6 +43,27 @@
 #define INSTR_SVM_STGI            ".byte 0x0f, 0x01, 0xdc"
 #define INSTR_SVM_CLGI            ".byte 0x0f, 0x01, 0xdd"
 
+enum reg {
+	VCPU_REGS_RAX = 0,
+	VCPU_REGS_RCX = 1,
+	VCPU_REGS_RDX = 2,
+	VCPU_REGS_RBX = 3,
+	VCPU_REGS_RSP = 4,
+	VCPU_REGS_RBP = 5,
+	VCPU_REGS_RSI = 6,
+	VCPU_REGS_RDI = 7,
+	VCPU_REGS_R8 = 8,
+	VCPU_REGS_R9 = 9,
+	VCPU_REGS_R10 = 10,
+	VCPU_REGS_R11 = 11,
+	VCPU_REGS_R12 = 12,
+	VCPU_REGS_R13 = 13,
+	VCPU_REGS_R14 = 14,
+	VCPU_REGS_R15 = 15,
+	VCPU_REGS_RIP,
+	NR_VCPU_REGS
+};
+
 struct svm_cpu_data {
 	int cpu;
 	u64 asid_generation;
@@ -49,12 +72,14 @@ struct svm_cpu_data {
 	struct page *save_area;
 };
 
-struct vcpu_svm {
+struct svm_vcpu {
 	int cpu;
+	int vcpu_id;
 	struct vmcb *vmcb;
 	unsigned long vmcb_pa;
 	struct svm_cpu_data *svm_data;
 	uint64_t asid_generation;
+	unsigned long regs[NR_VCPU_REGS];
 };
 
 //

@@ -569,18 +569,18 @@ static void initialize_naturalwidth_host_guest_state(void)
 static void save_registers(void)
 {
 	asm volatile("pushq %rcx\n"
-		"pushq %rdx\n"
-		"pushq %rax\n"
-		"pushq %rbx\n");
+		     "pushq %rdx\n"
+		     "pushq %rax\n"
+		     "pushq %rbx\n");
 
 }
 
 static void restore_registers(void)
 {
 	asm volatile("popq %rbx\n"
-		"popq %rax\n"
-		"popq %rdx\n"
-		"popq %rcx\n");
+		     "popq %rax\n"
+		     "popq %rdx\n"
+		     "popq %rcx\n");
 
 }
 
@@ -606,11 +606,11 @@ static void vmcb_init(struct svm_vcpu *vcpu)
 	struct vmcb_control_area *control = &vcpu->vmcb->control;
 	struct vmcb_save_area *save = &vcpu->vmcb->save;
 
-	vcpu->hflags = 0;
-
 	control->intercept |= (1ULL << INTERCEPT_VMMCALL);
 	control->clean &= ~(1 << VMCB_INTERCEPTS);
 
+	// Not sure
+	//
 	//control->iopm_base_pa = iopm_base;
 	//control->msrpm_base_pa = __pa(vcpu->msrpm);
 	//control->int_ctl = V_INTR_MASKING_MASK;
@@ -634,50 +634,25 @@ static void vmcb_init(struct svm_vcpu *vcpu)
 	init_sys_seg(&save->ldtr, SEG_TYPE_LDT);
 	init_sys_seg(&save->tr, SEG_TYPE_BUSY_TSS16);
 
-	save->efer = vcpu->efer | EFER_SVME;
+	save->efer = vcpu->efer | EFER_SVME | EFER_LMA | EFER_LME;
 	control->clean &= ~(1 << VMCB_CR);
 
 	save->dr6 = 0xffff0ff0;
-
 	save->rflags = 2;
-
 	save->rip = 0x0000fff0;
+
+	vcpu->efer = EFER_LME | EFER_LMA;
 	vcpu->regs[VCPU_REGS_RIP] = save->rip;
 
-	/*
-	 * svm_set_cr0() sets PG and WP and clears NW and CD on save->cr0.
-	 * It also updates the guest-visible cr0 value.
-	 */
-
-	if (vcpu->efer & EFER_LME) {
-		if (!is_paging(vcpu) && (cr0 & X86_CR0_PG)) {
-			vcpu->arch.efer |= EFER_LMA;
-			svm->vmcb->save.efer |= EFER_LMA | EFER_LME;
-		}
-
-		if (is_paging(vcpu) && !(cr0 & X86_CR0_PG)) {
-			vcpu->arch.efer &= ~EFER_LMA;
-			svm->vmcb->save.efer &= ~(EFER_LMA | EFER_LME);
-		}
-	}
-
 	const unsigned long cr0 = X86_CR0_NW | X86_CR0_CD | X86_CR0_ET | X86_CR0_PG | X86_CR0_WP;
-
 	vcpu->cr0 = cr0;
 	save->cr0 = cr0;
 	control->clean &= ~(1 << VMCB_CR);
-
-	update_cr0_intercept(svm);
-
 	save->cr4 = X86_CR4_PAE;
-	/* rdx = ?? */
-
-	vcpu->asid_generation = 0;
-
-	vcpu->hflags = 0;
-
 	control->clean = 0;
 
+	vcpu->hflags = 0;
+	vcpu->asid_generation = 0;
 	vcpu->hflags |= HF_GIF_MASK;
 }
 
@@ -713,6 +688,46 @@ free_svm:
 	kfree(vcpu);
 out:
 	return ERR_PTR(err);
+}
+
+static void vcpu_run(struct svm_vcpu *vcpu)
+{
+	// Host rip
+	asm ("movq $vmexit_handler, %rax");
+	asm ("movq %rax, %0" : "=r" (vcpu->vmcb->save.rip)
+			     :
+			     : "memory");
+
+	// Guest rip
+	asm ("movq $guest_entry_point, %rax");
+	asm ("movq %rax, %0" : "=r" (vcpu->regs[VCPU_REGS_RIP])
+			     :
+			     : "memory");
+
+	printk("Doing vmrun now..\n");
+
+	asm volatile (INSTR_SVM_CLGI);
+	asm volatile (INSTR_SVM_VMRUN);
+	asm volatile("jbe vmexit_handler\n");
+	asm volatile("nop\n"); //will never get here
+	asm volatile("guest_entry_point:");
+	asm volatile(INSTR_SVM_VMMCALL);
+	asm volatile("ud2\n"); //will never get here
+	asm volatile("vmexit_handler:\n");
+
+	printk("After #vmexit\n");
+
+	if (vcpu->vmcb->control.exit_code == SVM_EXIT_ERR) {
+		pr_err("VMRUN Failed\n");
+		return;
+	}
+
+	printk("Guest #vmexit\n");
+	printk("Code: 0x%x\n", vcpu->vmcb->control.exit_code);
+	printk("Info 1: 0x%x\n", vcpu->vmcb->control.exit_info_1);
+	printk("Info 2: 0x%x\n", vcpu->vmcb->control.exit_info_2);
+
+	vcpu->next_rip = vcpu->regs[VCPU_REGS_RIP] + 3;
 }
 
 static void vcpu_free(struct svm_vcpu *vcpu)
@@ -909,38 +924,12 @@ static int vmrun_init(void)
 		goto err;
 
 	for (unsigned int i = 0; i < NR_VCPUS; i++) {
-		vcpu_create(i);
-	}
 
-	//host rip
-	asm ("movq $0x6c16, %rdx");
-	asm ("movq $vmexit_handler, %rax");
-	asm ("vmwrite %rax, %rdx");
+		struct svm_vcpu *vcpu = vcpu_create(i);
 
-	//guest rip
-	asm ("movq $0x681e, %rdx");
-	asm ("movq $guest_entry_point, %rax");
-	asm ("vmwrite %rax, %rdx");
+		vcpu_run(vcpu);
 
-	printk("Doing vmrun now..\n");
-
-	asm volatile (INSTR_SVM_CLGI);
-	asm volatile (INSTR_SVM_VMRUN);
-	asm volatile("jbe vmexit_handler\n");
-	asm volatile("nop\n"); //will never get here
-	asm volatile("guest_entry_point:");
-	asm volatile(INSTR_SVM_VMMCALL);
-	asm volatile("ud2\n"); //will never get here
-	asm volatile("vmexit_handler:\n");
-
-	printk("After #vmexit\n");
-
-	// field_1 = VMX_EXIT_REASON;
-	// value = do_vmread(field_1);
-	// printk("Guest #vmexit reason: 0x%x\n", value);
-
-	for (unsigned int i = 0; i < NR_VCPUS; i++) {
-		vcpu_free(i);
+		vcpu_free(vcpu);
 	}
 
 	turn_off_svm();

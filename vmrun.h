@@ -107,6 +107,7 @@ struct svm_vcpu {
 	unsigned long cr0;
 	u32 hflags;
 	u64 efer;
+	u64 next_rip;
 	unsigned long regs[NR_VCPU_REGS];
 };
 

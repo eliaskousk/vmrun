@@ -202,9 +202,71 @@ static void vcpu_run(struct svm_vcpu *vcpu)
 
 	printk("Doing vmrun now...\n");
 
-	asm volatile (INSTR_SVM_CLGI);
-	asm volatile("cli\n");
-	asm volatile (INSTR_SVM_VMRUN);
+	asm volatile (
+		INSTR_SVM_CLGI "\n\t"
+		"push %%" _ASM_BP "; \n\t"
+		"mov %c[rbx](%[svm]), %%" _ASM_BX " \n\t"
+		"mov %c[rcx](%[svm]), %%" _ASM_CX " \n\t"
+		"mov %c[rdx](%[svm]), %%" _ASM_DX " \n\t"
+		"mov %c[rsi](%[svm]), %%" _ASM_SI " \n\t"
+		"mov %c[rdi](%[svm]), %%" _ASM_DI " \n\t"
+		"mov %c[rbp](%[svm]), %%" _ASM_BP " \n\t"
+		"mov %c[r8](%[svm]),  %%r8  \n\t"
+		"mov %c[r9](%[svm]),  %%r9  \n\t"
+		"mov %c[r10](%[svm]), %%r10 \n\t"
+		"mov %c[r11](%[svm]), %%r11 \n\t"
+		"mov %c[r12](%[svm]), %%r12 \n\t"
+		"mov %c[r13](%[svm]), %%r13 \n\t"
+		"mov %c[r14](%[svm]), %%r14 \n\t"
+		"mov %c[r15](%[svm]), %%r15 \n\t"
+
+		/* Enter guest mode */
+		"push %%" _ASM_AX " \n\t"
+		"mov %c[vmcb](%[svm]), %%" _ASM_AX " \n\t"
+		INSTR_SVM_VMLOAD "\n\t"
+		INSTR_SVM_VMRUN "\n\t"
+		INSTR_SVM_VMSAVE "\n\t"
+		"pop %%" _ASM_AX " \n\t"
+
+		/* Save guest registers, load host registers */
+		"mov %%" _ASM_BX ", %c[rbx](%[svm]) \n\t"
+		"mov %%" _ASM_CX ", %c[rcx](%[svm]) \n\t"
+		"mov %%" _ASM_DX ", %c[rdx](%[svm]) \n\t"
+		"mov %%" _ASM_SI ", %c[rsi](%[svm]) \n\t"
+		"mov %%" _ASM_DI ", %c[rdi](%[svm]) \n\t"
+		"mov %%" _ASM_BP ", %c[rbp](%[svm]) \n\t"
+		"mov %%r8,  %c[r8](%[svm]) \n\t"
+		"mov %%r9,  %c[r9](%[svm]) \n\t"
+		"mov %%r10, %c[r10](%[svm]) \n\t"
+		"mov %%r11, %c[r11](%[svm]) \n\t"
+		"mov %%r12, %c[r12](%[svm]) \n\t"
+		"mov %%r13, %c[r13](%[svm]) \n\t"
+		"mov %%r14, %c[r14](%[svm]) \n\t"
+		"mov %%r15, %c[r15](%[svm]) \n\t"
+		"pop %%" _ASM_BP
+
+		: // No outputs
+
+		: [svm]"a"(svm),
+		  [vmcb]"i"(offsetof(struct svm_vcpu, vmcb_pa)),
+		  [rbx]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_RBX])),
+		  [rcx]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_RCX])),
+		  [rdx]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_RDX])),
+		  [rsi]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_RSI])),
+		  [rdi]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_RDI])),
+		  [rbp]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_RBP]))
+		  [r8]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_R8])),
+		  [r9]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_R9])),
+		  [r10]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_R10])),
+		  [r11]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_R11])),
+		  [r12]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_R12])),
+		  [r13]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_R13])),
+		  [r14]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_R14])),
+		  [r15]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_R15]))
+
+		: "cc", "memory", "rbx", "rcx", "rdx", "rsi", "rdi",
+		  "r8", "r9", "r10", "r11" , "r12", "r13", "r14", "r15");
+
 	asm volatile("jbe vmexit_handler\n");
 	asm volatile("nop\n"); //will never get here
 	asm volatile("guest_entry_point:");
@@ -415,6 +477,8 @@ static int vmrun_init(void)
 		printk("SVM not supported or enabled on CPU, nothing to be done\n");
 		goto finish_here;
 	}
+	
+	asm volatile("cli\n");
 
 	r = turn_on_svm();
 	if (r)

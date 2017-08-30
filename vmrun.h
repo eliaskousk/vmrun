@@ -25,8 +25,6 @@
 #ifndef VMRUN_H
 #define VMRUN_H
 
-#define NR_VCPUS 2
-
 #define CPUID_EXT_1_SVM_LEAF      0x80000001
 #define CPUID_EXT_1_SVM_BIT       0x2
 #define CPUID_EXT_A_SVM_LOCK_LEAF 0x8000000a
@@ -38,10 +36,37 @@
 #define MSR_EFER_SVM_EN_BIT       0x12
 #define MSR_VM_HSAVE_PA           0xc0010117
 
+#define HF_GIF_MASK		  (1 << 0)
+
+#define SEG_TYPE_LDT              2
+#define SEG_TYPE_BUSY_TSS16       3
+
+#define NR_VCPUS                  2
+
 #define INSTR_SVM_VMRUN           ".byte 0x0f, 0x01, 0xd8"
 #define INSTR_SVM_VMMCALL         ".byte 0x0f, 0x01, 0xd9"
 #define INSTR_SVM_STGI            ".byte 0x0f, 0x01, 0xdc"
 #define INSTR_SVM_CLGI            ".byte 0x0f, 0x01, 0xdd"
+
+enum {
+	VMCB_INTERCEPTS, /* Intercept vectors, TSC offset,
+			    pause filter count */
+	VMCB_PERM_MAP,   /* IOPM Base and MSRPM Base */
+	VMCB_ASID,	 /* ASID */
+	VMCB_INTR,	 /* int_ctl, int_vector */
+	VMCB_NPT,        /* npt_en, nCR3, gPAT */
+	VMCB_CR,	 /* CR0, CR3, CR4, EFER */
+	VMCB_DR,         /* DR6, DR7 */
+	VMCB_DT,         /* GDT, IDT */
+	VMCB_SEG,        /* CS, DS, SS, ES, CPL */
+	VMCB_CR2,        /* CR2 only */
+	VMCB_LBR,        /* DBGCTL, BR_FROM, BR_TO, LAST_EX_FROM, LAST_EX_TO */
+	VMCB_AVIC,       /* AVIC APIC_BAR, AVIC APIC_BACKING_PAGE,
+			  * AVIC PHYSICAL_TABLE pointer,
+			  * AVIC LOGICAL_TABLE pointer
+			  */
+	VMCB_DIRTY_MAX,
+};
 
 enum reg {
 	VCPU_REGS_RAX = 0,
@@ -77,8 +102,11 @@ struct svm_vcpu {
 	int vcpu_id;
 	struct vmcb *vmcb;
 	unsigned long vmcb_pa;
-	struct svm_cpu_data *svm_data;
+	struct svm_cpu_data *cpu_data;
 	uint64_t asid_generation;
+	unsigned long cr0;
+	u32 hflags;
+	u64 efer;
 	unsigned long regs[NR_VCPU_REGS];
 };
 

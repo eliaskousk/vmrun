@@ -59,10 +59,8 @@ long int vmcb_phy_region = 0;
 u16 tr_sel; //selector for task register
 
 static DEFINE_PER_CPU(struct svm_vcpu *, local_vcpu);
-static DEFINE_PER_CPU(struct svm_cpu_data *, svm_data);
-static DEFINE_PER_CPU(struct vmcb *, svm_area);
-
-static void restore_registers(void);
+static DEFINE_PER_CPU(struct svm_cpu_data *, local_cpu_data);
+static DEFINE_PER_CPU(struct vmcb *, local_vmcb);
 
 static void initialize_16bit_host_guest_state(void)
 {
@@ -568,20 +566,6 @@ static void initialize_naturalwidth_host_guest_state(void)
 
 }
 
-static void initialize_guest_vmcb(void)
-{
-	initialize_16bit_host_guest_state();
-
-	initialize_64bit_control();
-	initialize_64bit_host_guest_state();
-
-	initialize_32bit_control();
-	initialize_32bit_host_guest_state();
-
-	initialize_naturalwidth_control();
-	initialize_naturalwidth_host_guest_state();
-}
-
 static void save_registers(void)
 {
 	asm volatile("pushq %rcx\n"
@@ -600,62 +584,36 @@ static void restore_registers(void)
 
 }
 
-static void vmcb_init(struct svm_vcpu *svm)
+static void init_seg(struct vmcb_seg *seg)
 {
-	struct vmcb_control_area *control = &svm->vmcb->control;
-	struct vmcb_save_area *save = &svm->vmcb->save;
+	seg->selector = 0;
+	seg->attrib = SVM_SELECTOR_P_MASK | SVM_SELECTOR_S_MASK |
+		      SVM_SELECTOR_WRITE_MASK; /* Read/Write Data Segment */
+	seg->limit = 0xffff;
+	seg->base = 0;
+}
 
-	svm->vcpu.arch.hflags = 0;
+static void init_sys_seg(struct vmcb_seg *seg, uint32_t type)
+{
+	seg->selector = 0;
+	seg->attrib = SVM_SELECTOR_P_MASK | type;
+	seg->limit = 0xffff;
+	seg->base = 0;
+}
 
-	set_cr_intercept(svm, INTERCEPT_CR0_READ);
-	set_cr_intercept(svm, INTERCEPT_CR3_READ);
-	set_cr_intercept(svm, INTERCEPT_CR4_READ);
-	set_cr_intercept(svm, INTERCEPT_CR0_WRITE);
-	set_cr_intercept(svm, INTERCEPT_CR3_WRITE);
-	set_cr_intercept(svm, INTERCEPT_CR4_WRITE);
-	if (!kvm_vcpu_apicv_active(&svm->vcpu))
-		set_cr_intercept(svm, INTERCEPT_CR8_WRITE);
+static void vmcb_init(struct svm_vcpu *vcpu)
+{
+	struct vmcb_control_area *control = &vcpu->vmcb->control;
+	struct vmcb_save_area *save = &vcpu->vmcb->save;
 
-	set_dr_intercepts(svm);
+	vcpu->hflags = 0;
 
-	set_exception_intercept(svm, PF_VECTOR);
-	set_exception_intercept(svm, UD_VECTOR);
-	set_exception_intercept(svm, MC_VECTOR);
-	set_exception_intercept(svm, AC_VECTOR);
-	set_exception_intercept(svm, DB_VECTOR);
+	control->intercept |= (1ULL << INTERCEPT_VMMCALL);
+	control->clean &= ~(1 << VMCB_INTERCEPTS);
 
-	set_intercept(svm, INTERCEPT_INTR);
-	set_intercept(svm, INTERCEPT_NMI);
-	set_intercept(svm, INTERCEPT_SMI);
-	set_intercept(svm, INTERCEPT_SELECTIVE_CR0);
-	set_intercept(svm, INTERCEPT_RDPMC);
-	set_intercept(svm, INTERCEPT_CPUID);
-	set_intercept(svm, INTERCEPT_INVD);
-	set_intercept(svm, INTERCEPT_HLT);
-	set_intercept(svm, INTERCEPT_INVLPG);
-	set_intercept(svm, INTERCEPT_INVLPGA);
-	set_intercept(svm, INTERCEPT_IOIO_PROT);
-	set_intercept(svm, INTERCEPT_MSR_PROT);
-	set_intercept(svm, INTERCEPT_TASK_SWITCH);
-	set_intercept(svm, INTERCEPT_SHUTDOWN);
-	set_intercept(svm, INTERCEPT_VMRUN);
-	set_intercept(svm, INTERCEPT_VMMCALL);
-	set_intercept(svm, INTERCEPT_VMLOAD);
-	set_intercept(svm, INTERCEPT_VMSAVE);
-	set_intercept(svm, INTERCEPT_STGI);
-	set_intercept(svm, INTERCEPT_CLGI);
-	set_intercept(svm, INTERCEPT_SKINIT);
-	set_intercept(svm, INTERCEPT_WBINVD);
-	set_intercept(svm, INTERCEPT_XSETBV);
-
-	if (!kvm_mwait_in_guest()) {
-		set_intercept(svm, INTERCEPT_MONITOR);
-		set_intercept(svm, INTERCEPT_MWAIT);
-	}
-
-	control->iopm_base_pa = iopm_base;
-	control->msrpm_base_pa = __pa(svm->msrpm);
-	control->int_ctl = V_INTR_MASKING_MASK;
+	//control->iopm_base_pa = iopm_base;
+	//control->msrpm_base_pa = __pa(vcpu->msrpm);
+	//control->int_ctl = V_INTR_MASKING_MASK;
 
 	init_seg(&save->es);
 	init_seg(&save->ss);
@@ -676,50 +634,51 @@ static void vmcb_init(struct svm_vcpu *svm)
 	init_sys_seg(&save->ldtr, SEG_TYPE_LDT);
 	init_sys_seg(&save->tr, SEG_TYPE_BUSY_TSS16);
 
-	svm_set_efer(&svm->vcpu, 0);
+	save->efer = vcpu->efer | EFER_SVME;
+	control->clean &= ~(1 << VMCB_CR);
+
 	save->dr6 = 0xffff0ff0;
-	kvm_set_rflags(&svm->vcpu, 2);
+
+	save->rflags = 2;
+
 	save->rip = 0x0000fff0;
-	svm->vcpu.arch.regs[VCPU_REGS_RIP] = save->rip;
+	vcpu->regs[VCPU_REGS_RIP] = save->rip;
 
 	/*
 	 * svm_set_cr0() sets PG and WP and clears NW and CD on save->cr0.
 	 * It also updates the guest-visible cr0 value.
 	 */
-	svm_set_cr0(&svm->vcpu, X86_CR0_NW | X86_CR0_CD | X86_CR0_ET);
-	kvm_mmu_reset_context(&svm->vcpu);
+
+	if (vcpu->efer & EFER_LME) {
+		if (!is_paging(vcpu) && (cr0 & X86_CR0_PG)) {
+			vcpu->arch.efer |= EFER_LMA;
+			svm->vmcb->save.efer |= EFER_LMA | EFER_LME;
+		}
+
+		if (is_paging(vcpu) && !(cr0 & X86_CR0_PG)) {
+			vcpu->arch.efer &= ~EFER_LMA;
+			svm->vmcb->save.efer &= ~(EFER_LMA | EFER_LME);
+		}
+	}
+
+	const unsigned long cr0 = X86_CR0_NW | X86_CR0_CD | X86_CR0_ET | X86_CR0_PG | X86_CR0_WP;
+
+	vcpu->cr0 = cr0;
+	save->cr0 = cr0;
+	control->clean &= ~(1 << VMCB_CR);
+
+	update_cr0_intercept(svm);
 
 	save->cr4 = X86_CR4_PAE;
 	/* rdx = ?? */
 
-	if (npt_enabled) {
-		/* Setup VMCB for Nested Paging */
-		control->nested_ctl = 1;
-		clr_intercept(svm, INTERCEPT_INVLPG);
-		clr_exception_intercept(svm, PF_VECTOR);
-		clr_cr_intercept(svm, INTERCEPT_CR3_READ);
-		clr_cr_intercept(svm, INTERCEPT_CR3_WRITE);
-		save->g_pat = svm->vcpu.arch.pat;
-		save->cr3 = 0;
-		save->cr4 = 0;
-	}
-	svm->asid_generation = 0;
+	vcpu->asid_generation = 0;
 
-	svm->nested.vmcb = 0;
-	svm->vcpu.arch.hflags = 0;
+	vcpu->hflags = 0;
 
-	if (boot_cpu_has(X86_FEATURE_PAUSEFILTER)) {
-		control->pause_filter_count = 3000;
-		set_intercept(svm, INTERCEPT_PAUSE);
-	}
+	control->clean = 0;
 
-	if (avic)
-		avic_init_vmcb(svm);
-
-	mark_all_dirty(svm->vmcb);
-
-	enable_gif(svm);
-
+	vcpu->hflags |= HF_GIF_MASK;
 }
 
 static struct svm_vcpu *vcpu_create(unsigned int id)

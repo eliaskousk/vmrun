@@ -137,16 +137,15 @@ static void vmcb_init(struct svm_vcpu *vcpu)
 	save->rflags = 2;
 	save->rip = 0x0000fff0;
 
-	vcpu->efer = EFER_LME | EFER_LMA;
-	vcpu->regs[VCPU_REGS_RIP] = save->rip;
-
 	const unsigned long cr0 = X86_CR0_NW | X86_CR0_CD | X86_CR0_ET | X86_CR0_PG | X86_CR0_WP;
-	vcpu->cr0 = cr0;
 	save->cr0 = cr0;
 	control->clean &= ~(1 << VMCB_CR);
 	save->cr4 = X86_CR4_PAE;
 	control->clean = 0;
 
+	vcpu->cr0 = cr0;
+	vcpu->efer = EFER_LME | EFER_LMA;
+	vcpu->regs[VCPU_REGS_RIP] = save->rip;
 	vcpu->hflags = 0;
 	vcpu->asid_generation = 0;
 	vcpu->hflags |= HF_GIF_MASK;
@@ -188,73 +187,70 @@ out:
 
 static void vcpu_run(struct svm_vcpu *vcpu)
 {
-	// Host rip
-	asm ("movq $vmexit_handler, %rax");
-	asm ("movq %rax, %0" : "=r" (vcpu->vmcb->save.rip)
-			     :
-			     : "memory");
-
 	// Guest rip
-	asm ("movq $guest_entry_point, %rax");
-	asm ("movq %rax, %0" : "=r" (vcpu->regs[VCPU_REGS_RIP])
-			     :
-			     : "memory");
+	asm volatile("movq $guest_entry_point, %rax");
+	asm volatile("movq %%rax, %0" : "=r" (vcpu->vmcb->save.rip)
+			              :
+				      : "memory");
+	asm ("movq %%rax, %0" : "=r" (vcpu->regs[VCPU_REGS_RIP])
+			      :
+			      : "memory");
 
 	printk("Doing vmrun now...\n");
 
-	asm volatile (
+	asm volatile(
 		INSTR_SVM_CLGI "\n\t"
 		"push %%" _ASM_BP "; \n\t"
-		"mov %c[rbx](%[svm]), %%" _ASM_BX " \n\t"
-		"mov %c[rcx](%[svm]), %%" _ASM_CX " \n\t"
-		"mov %c[rdx](%[svm]), %%" _ASM_DX " \n\t"
-		"mov %c[rsi](%[svm]), %%" _ASM_SI " \n\t"
-		"mov %c[rdi](%[svm]), %%" _ASM_DI " \n\t"
-		"mov %c[rbp](%[svm]), %%" _ASM_BP " \n\t"
-		"mov %c[r8](%[svm]),  %%r8  \n\t"
-		"mov %c[r9](%[svm]),  %%r9  \n\t"
-		"mov %c[r10](%[svm]), %%r10 \n\t"
-		"mov %c[r11](%[svm]), %%r11 \n\t"
-		"mov %c[r12](%[svm]), %%r12 \n\t"
-		"mov %c[r13](%[svm]), %%r13 \n\t"
-		"mov %c[r14](%[svm]), %%r14 \n\t"
-		"mov %c[r15](%[svm]), %%r15 \n\t"
+		"mov %c[rbx](%[vcpu]), %%" _ASM_BX " \n\t"
+		"mov %c[rcx](%[vcpu]), %%" _ASM_CX " \n\t"
+		"mov %c[rdx](%[vcpu]), %%" _ASM_DX " \n\t"
+		"mov %c[rsi](%[vcpu]), %%" _ASM_SI " \n\t"
+		"mov %c[rdi](%[vcpu]), %%" _ASM_DI " \n\t"
+		"mov %c[rbp](%[vcpu]), %%" _ASM_BP " \n\t"
+		"mov %c[r8](%[vcpu]),  %%r8  \n\t"
+		"mov %c[r9](%[vcpu]),  %%r9  \n\t"
+		"mov %c[r10](%[vcpu]), %%r10 \n\t"
+		"mov %c[r11](%[vcpu]), %%r11 \n\t"
+		"mov %c[r12](%[vcpu]), %%r12 \n\t"
+		"mov %c[r13](%[vcpu]), %%r13 \n\t"
+		"mov %c[r14](%[vcpu]), %%r14 \n\t"
+		"mov %c[r15](%[vcpu]), %%r15 \n\t"
 
 		/* Enter guest mode */
 		"push %%" _ASM_AX " \n\t"
-		"mov %c[vmcb](%[svm]), %%" _ASM_AX " \n\t"
+		"mov %c[vmcb](%[vcpu]), %%" _ASM_AX " \n\t"
 		INSTR_SVM_VMLOAD "\n\t"
 		INSTR_SVM_VMRUN "\n\t"
 		INSTR_SVM_VMSAVE "\n\t"
 		"pop %%" _ASM_AX " \n\t"
 
 		/* Save guest registers, load host registers */
-		"mov %%" _ASM_BX ", %c[rbx](%[svm]) \n\t"
-		"mov %%" _ASM_CX ", %c[rcx](%[svm]) \n\t"
-		"mov %%" _ASM_DX ", %c[rdx](%[svm]) \n\t"
-		"mov %%" _ASM_SI ", %c[rsi](%[svm]) \n\t"
-		"mov %%" _ASM_DI ", %c[rdi](%[svm]) \n\t"
-		"mov %%" _ASM_BP ", %c[rbp](%[svm]) \n\t"
-		"mov %%r8,  %c[r8](%[svm]) \n\t"
-		"mov %%r9,  %c[r9](%[svm]) \n\t"
-		"mov %%r10, %c[r10](%[svm]) \n\t"
-		"mov %%r11, %c[r11](%[svm]) \n\t"
-		"mov %%r12, %c[r12](%[svm]) \n\t"
-		"mov %%r13, %c[r13](%[svm]) \n\t"
-		"mov %%r14, %c[r14](%[svm]) \n\t"
-		"mov %%r15, %c[r15](%[svm]) \n\t"
+		"mov %%" _ASM_BX ", %c[rbx](%[vcpu]) \n\t"
+		"mov %%" _ASM_CX ", %c[rcx](%[vcpu]) \n\t"
+		"mov %%" _ASM_DX ", %c[rdx](%[vcpu]) \n\t"
+		"mov %%" _ASM_SI ", %c[rsi](%[vcpu]) \n\t"
+		"mov %%" _ASM_DI ", %c[rdi](%[vcpu]) \n\t"
+		"mov %%" _ASM_BP ", %c[rbp](%[vcpu]) \n\t"
+		"mov %%r8,  %c[r8](%[vcpu]) \n\t"
+		"mov %%r9,  %c[r9](%[vcpu]) \n\t"
+		"mov %%r10, %c[r10](%[vcpu]) \n\t"
+		"mov %%r11, %c[r11](%[vcpu]) \n\t"
+		"mov %%r12, %c[r12](%[vcpu]) \n\t"
+		"mov %%r13, %c[r13](%[vcpu]) \n\t"
+		"mov %%r14, %c[r14](%[vcpu]) \n\t"
+		"mov %%r15, %c[r15](%[vcpu]) \n\t"
 		"pop %%" _ASM_BP
 
 		: // No outputs
 
-		: [svm]"a"(svm),
+		: [vcpu]"a"(vcpu),
 		  [vmcb]"i"(offsetof(struct svm_vcpu, vmcb_pa)),
 		  [rbx]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_RBX])),
 		  [rcx]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_RCX])),
 		  [rdx]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_RDX])),
 		  [rsi]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_RSI])),
 		  [rdi]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_RDI])),
-		  [rbp]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_RBP]))
+		  [rbp]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_RBP])),
 		  [r8]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_R8])),
 		  [r9]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_R9])),
 		  [r10]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_R10])),
@@ -267,26 +263,29 @@ static void vcpu_run(struct svm_vcpu *vcpu)
 		: "cc", "memory", "rbx", "rcx", "rdx", "rsi", "rdi",
 		  "r8", "r9", "r10", "r11" , "r12", "r13", "r14", "r15");
 
-	asm volatile("jbe vmexit_handler\n");
+	printk("After #vmexit\n");
+	asm volatile("jmp vmexit_handler\n");
 	asm volatile("nop\n"); //will never get here
+
 	asm volatile("guest_entry_point:");
 	asm volatile(INSTR_SVM_VMMCALL);
 	asm volatile("ud2\n"); //will never get here
-	asm volatile("vmexit_handler:\n");
 
-	printk("After #vmexit\n");
+	asm volatile("vmexit_handler:\n");
+	printk("Guest #vmexit Info\n");
+	printk("Code: 0x%x\n", vcpu->vmcb->control.exit_code);
+	printk("Info 1: 0x%x\n", vcpu->vmcb->control.exit_info_1);
+	printk("Info 2: 0x%x\n", vcpu->vmcb->control.exit_info_2);
 
 	if (vcpu->vmcb->control.exit_code == SVM_EXIT_ERR) {
 		pr_err("VMRUN Failed\n");
 		return;
 	}
 
-	printk("Guest #vmexit\n");
-	printk("Code: 0x%x\n", vcpu->vmcb->control.exit_code);
-	printk("Info 1: 0x%x\n", vcpu->vmcb->control.exit_info_1);
-	printk("Info 2: 0x%x\n", vcpu->vmcb->control.exit_info_2);
-
-	vcpu->next_rip = vcpu->regs[VCPU_REGS_RIP] + 3;
+	if (vcpu->vmcb->control.exit_code == SVM_EXIT_VMMCALL) {
+		printk("VMRUN and VMMCALL Succeeded\b");
+		vcpu->next_rip = vcpu->regs[VCPU_REGS_RIP] + 3;
+	}
 }
 
 static void vcpu_free(struct svm_vcpu *vcpu)
@@ -295,7 +294,7 @@ static void vcpu_free(struct svm_vcpu *vcpu)
 	kfree(vcpu);
 }
 
-static int cpu_init(int cpu)
+static int local_cpu_init(int cpu)
 {
 	struct svm_cpu_data *sd;
 	int r;
@@ -309,7 +308,7 @@ static int cpu_init(int cpu)
 	if (!sd->save_area)
 		goto err;
 
-	per_cpu(svm_data, cpu) = sd;
+	per_cpu(local_cpu_data, cpu) = sd;
 
 	return 0;
 
@@ -318,14 +317,14 @@ err:
 	return r;
 }
 
-static void cpu_uninit(int cpu)
+static void local_cpu_uninit(int cpu)
 {
-	struct svm_cpu_data *sd = per_cpu(svm_data, raw_smp_processor_id());
+	struct svm_cpu_data *sd = per_cpu(local_cpu_data, raw_smp_processor_id());
 
 	if (!sd)
 		return;
 
-	per_cpu(svm_data, raw_smp_processor_id()) = NULL;
+	per_cpu(local_cpu_data, raw_smp_processor_id()) = NULL;
 	__free_page(sd->save_area);
 	kfree(sd);
 }
@@ -352,23 +351,22 @@ static int turn_on_svm(void)
 	printk("Turned on MSR EFER.svme\n");
 
 	for_each_possible_cpu(cpu) {
-		r = cpu_init(cpu);
+		r = local_cpu_init(cpu);
 		if (r)
 			return r;
 	}
 
-	sd = per_cpu(svm_data, me);
+	sd = per_cpu(local_cpu_data, me);
 	if (!sd) {
 		pr_err("%s: svm_data is NULL on %d\n", __func__, me);
 		return -EINVAL;
 	}
 
 	sd->asid_generation = 1;
-
-	asm volatile("cpuid\n\t" : "=b" ((sd->max_asid - 1))
+	asm volatile("cpuid\n\t" : "=b" (sd->max_asid)
 				 : "a" (CPUID_EXT_A_SVM_LOCK_LEAF)
 				 : "%rcx","%rdx");
-
+	sd->max_asid--;
 	sd->next_asid = sd->max_asid + 1;
 
 	asm volatile("wrmsr\n" :
@@ -389,7 +387,7 @@ static void turn_off_svm(void)
 			       : "memory");
 
 	for_each_possible_cpu(cpu)
-		cpu_uninit(cpu);
+		local_cpu_uninit(cpu);
 
 	asm volatile("rdmsr\n" : "=a" (msr_efer_value)
 			       : "c"  (msr_efer_addr)

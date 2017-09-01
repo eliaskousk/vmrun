@@ -49,36 +49,17 @@
 #include <linux/kernel.h>
 #include <linux/vmalloc.h>
 #include <linux/slab.h>
+#include <asm/desc.h>
 #include <asm/virtext.h>
 #include "vmrun.h"
 
 MODULE_LICENSE("Dual BSD/GPL");
 
-char *vmcb_guest_region;
-long int vmcb_phy_region = 0;
-u16 tr_sel; //selector for task register
-
-static DEFINE_PER_CPU(struct svm_vcpu *, local_vcpu);
+// static DEFINE_PER_CPU(struct svm_vcpu *, local_vcpu);
 static DEFINE_PER_CPU(struct svm_cpu_data *, local_cpu_data);
-static DEFINE_PER_CPU(struct vmcb *, local_vmcb);
+// static DEFINE_PER_CPU(struct vmcb *, local_vmcb);
 
-static void save_registers(void)
-{
-	asm volatile("pushq %rcx\n"
-		     "pushq %rdx\n"
-		     "pushq %rax\n"
-		     "pushq %rbx\n");
-
-}
-
-static void restore_registers(void)
-{
-	asm volatile("popq %rbx\n"
-		     "popq %rax\n"
-		     "popq %rdx\n"
-		     "popq %rcx\n");
-
-}
+static unsigned long iopm_base;
 
 static void init_seg(struct vmcb_seg *seg)
 {
@@ -101,15 +82,14 @@ static void vmcb_init(struct svm_vcpu *vcpu)
 {
 	struct vmcb_control_area *control = &vcpu->vmcb->control;
 	struct vmcb_save_area *save = &vcpu->vmcb->save;
+	unsigned long cr0 = 0;
 
 	control->intercept |= (1ULL << INTERCEPT_VMMCALL);
 	control->clean &= ~(1 << VMCB_INTERCEPTS);
 
-	// Not sure
-	//
-	//control->iopm_base_pa = iopm_base;
-	//control->msrpm_base_pa = __pa(vcpu->msrpm);
-	//control->int_ctl = V_INTR_MASKING_MASK;
+	control->iopm_base_pa = iopm_base;
+	control->msrpm_base_pa = __pa(vcpu->msrpm);
+	control->int_ctl = V_INTR_MASK;
 
 	init_seg(&save->es);
 	init_seg(&save->ss);
@@ -137,7 +117,7 @@ static void vmcb_init(struct svm_vcpu *vcpu)
 	save->rflags = 2;
 	save->rip = 0x0000fff0;
 
-	const unsigned long cr0 = X86_CR0_NW | X86_CR0_CD | X86_CR0_ET | X86_CR0_PG | X86_CR0_WP;
+	cr0 = X86_CR0_NW | X86_CR0_CD | X86_CR0_ET | X86_CR0_PG | X86_CR0_WP;
 	save->cr0 = cr0;
 	control->clean &= ~(1 << VMCB_CR);
 	save->cr4 = X86_CR4_PAE;
@@ -155,6 +135,7 @@ static struct svm_vcpu *vcpu_create(unsigned int id)
 {
 	struct svm_vcpu *vcpu;
 	struct page *vmcb_page;
+	struct page *msrpm_pages;
 	int err;
 
 	vcpu = kzalloc(sizeof(struct svm_vcpu), GFP_KERNEL);
@@ -169,7 +150,14 @@ static struct svm_vcpu *vcpu_create(unsigned int id)
 	err = -ENOMEM;
 	vmcb_page = alloc_page(GFP_KERNEL);
 	if (!vmcb_page)
-		goto free_svm;
+		goto free_vcpu;
+
+	msrpm_pages = alloc_pages(GFP_KERNEL, MSRPM_ALLOC_ORDER);
+	if (!msrpm_pages)
+		goto free_vmcb;
+
+	vcpu->msrpm = page_address(msrpm_pages);
+	memset(vcpu->msrpm, 0xff, PAGE_SIZE * (1 << MSRPM_ALLOC_ORDER));
 
 	vcpu->vmcb = page_address(vmcb_page);
 	clear_page(vcpu->vmcb);
@@ -179,7 +167,9 @@ static struct svm_vcpu *vcpu_create(unsigned int id)
 
 	return vcpu;
 
-free_svm:
+free_vmcb:
+	__free_page(vmcb_page);
+free_vcpu:
 	kfree(vcpu);
 out:
 	return ERR_PTR(err);
@@ -251,8 +241,8 @@ static void vcpu_run(struct svm_vcpu *vcpu)
 		  [rsi]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_RSI])),
 		  [rdi]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_RDI])),
 		  [rbp]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_RBP])),
-		  [r8]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_R8])),
-		  [r9]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_R9])),
+		  [r8]"i"(offsetof(struct svm_vcpu,  regs[VCPU_REGS_R8])),
+		  [r9]"i"(offsetof(struct svm_vcpu,  regs[VCPU_REGS_R9])),
 		  [r10]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_R10])),
 		  [r11]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_R11])),
 		  [r12]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_R12])),
@@ -274,8 +264,8 @@ static void vcpu_run(struct svm_vcpu *vcpu)
 	asm volatile("vmexit_handler:\n");
 	printk("Guest #vmexit Info\n");
 	printk("Code: 0x%x\n", vcpu->vmcb->control.exit_code);
-	printk("Info 1: 0x%x\n", vcpu->vmcb->control.exit_info_1);
-	printk("Info 2: 0x%x\n", vcpu->vmcb->control.exit_info_2);
+	printk("Info 1: 0x%llx\n", vcpu->vmcb->control.exit_info_1);
+	printk("Info 2: 0x%llx\n", vcpu->vmcb->control.exit_info_2);
 
 	if (vcpu->vmcb->control.exit_code == SVM_EXIT_ERR) {
 		pr_err("VMRUN Failed\n");
@@ -296,47 +286,59 @@ static void vcpu_free(struct svm_vcpu *vcpu)
 
 static int local_cpu_init(int cpu)
 {
-	struct svm_cpu_data *sd;
+	struct svm_cpu_data *cd;
 	int r;
 
-	sd = kzalloc(sizeof(struct svm_cpu_data), GFP_KERNEL);
-	if (!sd)
+	cd = kzalloc(sizeof(struct svm_cpu_data), GFP_KERNEL);
+	if (!cd)
 		return -ENOMEM;
-	sd->cpu = cpu;
-	sd->save_area = alloc_page(GFP_KERNEL);
+	cd->cpu = cpu;
+	cd->save_area = alloc_page(GFP_KERNEL);
 	r = -ENOMEM;
-	if (!sd->save_area)
+	if (!cd->save_area)
 		goto err;
 
-	per_cpu(local_cpu_data, cpu) = sd;
+	per_cpu(local_cpu_data, cpu) = cd;
 
 	return 0;
 
 err:
-	kfree(sd);
+	kfree(cd);
 	return r;
 }
 
 static void local_cpu_uninit(int cpu)
 {
-	struct svm_cpu_data *sd = per_cpu(local_cpu_data, raw_smp_processor_id());
+	struct svm_cpu_data *cd = per_cpu(local_cpu_data, raw_smp_processor_id());
 
-	if (!sd)
+	if (!cd)
 		return;
 
 	per_cpu(local_cpu_data, raw_smp_processor_id()) = NULL;
-	__free_page(sd->save_area);
-	kfree(sd);
+	__free_page(cd->save_area);
+	kfree(cd);
 }
 
-static int turn_on_svm(void)
+static int svm_setup(void)
 {
 	int msr_efer_addr  = MSR_EFER_SVM_EN_ADDR;
 	int msr_efer_value = 0;
-	struct svm_cpu_data *sd;
+	struct svm_cpu_data *cd;
 	int me = raw_smp_processor_id();
+	struct desc_struct *gdt;
+	struct page *iopm_pages;
+	void *iopm_va;
 	int cpu;
 	int r;
+
+	iopm_pages = alloc_pages(GFP_KERNEL, IOPM_ALLOC_ORDER);
+
+	if (!iopm_pages)
+		return -ENOMEM;
+
+	iopm_va = page_address(iopm_pages);
+	memset(iopm_va, 0xff, PAGE_SIZE * (1 << IOPM_ALLOC_ORDER));
+	iopm_base = page_to_pfn(iopm_pages) << PAGE_SHIFT;
 
 	asm volatile("rdmsr\n" : "=a" (msr_efer_value)
 			       : "c"  (msr_efer_addr)
@@ -353,30 +355,39 @@ static int turn_on_svm(void)
 	for_each_possible_cpu(cpu) {
 		r = local_cpu_init(cpu);
 		if (r)
-			return r;
+			goto err;
 	}
 
-	sd = per_cpu(local_cpu_data, me);
-	if (!sd) {
-		pr_err("%s: svm_data is NULL on %d\n", __func__, me);
-		return -EINVAL;
+	cd = per_cpu(local_cpu_data, me);
+	if (!cd) {
+		pr_err("%s: cpu_data is NULL on %d\n", __func__, me);
+		r = -EINVAL;
+		goto err;
 	}
 
-	sd->asid_generation = 1;
-	asm volatile("cpuid\n\t" : "=b" (sd->max_asid)
+	cd->asid_generation = 1;
+	asm volatile("cpuid\n\t" : "=b" (cd->max_asid)
 				 : "a" (CPUID_EXT_A_SVM_LOCK_LEAF)
 				 : "%rcx","%rdx");
-	sd->max_asid--;
-	sd->next_asid = sd->max_asid + 1;
+	cd->max_asid--;
+	cd->next_asid = cd->max_asid + 1;
+
+	gdt = this_cpu_ptr(&gdt_page)->gdt;
+	cd->tss_desc = (struct ldttss_desc *)(gdt + GDT_ENTRY_TSS);
 
 	asm volatile("wrmsr\n" :
-			       : "c" (MSR_VM_HSAVE_PA), "a" (page_to_pfn(sd->save_area) << PAGE_SHIFT)
+			       : "c" (MSR_VM_HSAVE_PA), "a" (page_to_pfn(cd->save_area) << PAGE_SHIFT)
 			       : "memory");
 
 	return 0;
+
+err:
+	__free_pages(iopm_pages, IOPM_ALLOC_ORDER);
+	iopm_base = 0;
+	return r;
 }
 
-static void turn_off_svm(void)
+static void svm_unsetup(void)
 {
 	int msr_efer_addr  = MSR_EFER_SVM_EN_ADDR;
 	int msr_efer_value = 0;
@@ -400,6 +411,9 @@ static void turn_off_svm(void)
 			       : "memory");
 
 	printk("Turned off MSR EFER.svme\n");
+
+	__free_pages(pfn_to_page(iopm_base >> PAGE_SHIFT), IOPM_ALLOC_ORDER);
+	iopm_base = 0;
 }
 
 static int has_svm (void)
@@ -463,11 +477,8 @@ static int has_svm (void)
 static int vmrun_init(void)
 {
 	int r;
-	u64 value = 0;
 
 	printk("Initializing AMD-V (SVM) vmrun driver\n");
-
-	save_registers();
 
 	if (has_svm()) {
 		printk("SVM is supported and enabled on CPU\n");
@@ -478,7 +489,7 @@ static int vmrun_init(void)
 	
 	asm volatile("cli\n");
 
-	r = turn_on_svm();
+	r = svm_setup();
 	if (r)
 		goto err;
 
@@ -491,21 +502,17 @@ static int vmrun_init(void)
 		vcpu_free(vcpu);
 	}
 
-	turn_off_svm();
+	svm_unsetup();
 
 	asm volatile("sti\n");
 	printk("Enabled Interrupts\n");
 
 finish_here:
 	printk("Done\n");
-
-	restore_registers();
-
 	return 0;
 
 err:
 	printk("Error\n");
-	restore_registers();
 	return r;
 }
 

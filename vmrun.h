@@ -37,6 +37,10 @@
 #define MSR_VM_HSAVE_PA           0xc0010117
 
 #define HF_GIF_MASK		  (1 << 0)
+#define V_INTR_MASK               (1 << 24)
+
+#define IOPM_ALLOC_ORDER          2
+#define MSRPM_ALLOC_ORDER         1
 
 #define SEG_TYPE_LDT              2
 #define SEG_TYPE_BUSY_TSS16       3
@@ -91,11 +95,21 @@ enum reg {
 	NR_VCPU_REGS
 };
 
+struct ldttss_desc {
+	u16 limit0;
+	u16 base0;
+	unsigned base1:8, type:5, dpl:2, p:1;
+	unsigned limit1:4, zero0:3, g:1, base2:8;
+	u32 base3;
+	u32 zero1;
+} __attribute__((packed));
+
 struct svm_cpu_data {
 	int cpu;
 	u64 asid_generation;
 	u32 max_asid;
 	u32 next_asid;
+	struct ldttss_desc *tss_desc;
 	struct page *save_area;
 };
 
@@ -110,6 +124,7 @@ struct svm_vcpu {
 	u32 hflags;
 	u64 efer;
 	u64 next_rip;
+	u32 *msrpm;
 	unsigned long regs[NR_VCPU_REGS];
 };
 

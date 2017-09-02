@@ -449,6 +449,8 @@ static int svm_setup(void)
 	memset(iopm_va, 0xff, PAGE_SIZE * (1 << IOPM_ALLOC_ORDER));
 	iopm_base = page_to_pfn(iopm_pages) << PAGE_SHIFT;
 
+	printk("svm_setup: Allocated I/O permission map");
+
 	asm volatile("rdmsr\n\t" : "=A" (msr_efer_value)
 			         : "c"  (msr_efer_addr)
 			         :);
@@ -467,6 +469,8 @@ static int svm_setup(void)
 			goto err;
 	}
 
+	printk("svm_setup: Allocated local CPU data");
+
 	cd = per_cpu(local_cpu_data, me);
 	if (!cd) {
 		pr_err("%s: cpu_data is NULL on %d\n", __func__, me);
@@ -481,12 +485,18 @@ static int svm_setup(void)
 	cd->max_asid--;
 	cd->next_asid = cd->max_asid + 1;
 
+	printk("svm_setup: Initialized ASID");
+
 	gdt = this_cpu_ptr(&gdt_page)->gdt;
 	cd->tss_desc = (struct ldttss_desc *)(gdt + GDT_ENTRY_TSS);
 
+	printk("svm_setup: Registered TSS descriptor");
+
 	asm volatile("wrmsr\n\t" :
-			       : "c" (MSR_VM_HSAVE_PA), "A" (page_to_pfn(cd->save_area) << PAGE_SHIFT)
-			       :);
+			         : "c" (MSR_VM_HSAVE_PA), "A" (page_to_pfn(cd->save_area) << PAGE_SHIFT)
+			         :);
+
+	printk("svm_setup: Registered host save area");
 
 	return 0;
 
@@ -503,26 +513,32 @@ static void svm_unsetup(void)
 	int cpu;
 
 	asm volatile("wrmsr\n\t" :
-			       : "c" (MSR_VM_HSAVE_PA), "a" (0)
-			       : "memory");
+			         : "c" (MSR_VM_HSAVE_PA), "A" (0)
+			         :);
+
+	printk("svm_setup: Unregistered host save area");
 
 	for_each_possible_cpu(cpu)
 		local_cpu_uninit(cpu);
 
-	asm volatile("rdmsr\n\t" : "=a" (msr_efer_value)
+	printk("svm_setup: Freed local CPU data");
+
+	asm volatile("rdmsr\n\t" : "=A" (msr_efer_value)
 			       : "c"  (msr_efer_addr)
-			       : "%rdx");
+			       :);
 
 	msr_efer_value &= ~(1 << MSR_EFER_SVM_EN_BIT);
 
 	asm volatile("wrmsr\n\t" :
-			       : "c" (msr_efer_addr), "a" (msr_efer_value)
-			       : "memory");
+			         : "c" (msr_efer_addr), "A" (msr_efer_value)
+			         :);
 
 	printk("Turned off MSR EFER.svme\n");
 
 	__free_pages(pfn_to_page(iopm_base >> PAGE_SHIFT), IOPM_ALLOC_ORDER);
 	iopm_base = 0;
+
+	printk("svm_setup: Freed I/O permission map");
 }
 
 static int has_svm (void)

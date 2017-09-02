@@ -626,12 +626,29 @@ static int vmrun_init(void)
 
 	for (unsigned int i = 0; i < NR_VCPUS; i++) {
 
+		unsigned int smp_id = raw_smp_processor_id();
+
+		if (smp_id == i % num_online_cpus()) {
+
+			struct svm_vcpu *vcpu = vcpu_create(i);
+			printk("vmrun_init: Created vcpu %d\n", i);
+			vcpu_setup(vcpu);
+			printk("vmrun_init: Setup vcpu %d\n", i);
+			/*vcpu_run(vcpu);*/
+			/*printk("vmrun_init: Run vcpu %d\n", i);*/
+			vcpu_free(vcpu);
+			printk("vmrun_init: Freed vcpu %d\n", i);
+		}
+	}
+
+	for (unsigned int i = 0; i < NR_VCPUS; i++) {
+
 		struct svm_vcpu *vcpu = vcpu_create(i);
 
-        printk("vmrun_init: Created vcpu %d\n", i);
+
 
         vcpu_setup(vcpu);
-        printk("vmrun_init: Setup vcpu %d\n", i);
+
 
 		/*vcpu_run(vcpu);*/
         /*printk("vmrun_init: Run vcpu %d\n", i);*/

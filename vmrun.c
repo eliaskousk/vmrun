@@ -142,6 +142,8 @@ static struct svm_vcpu *vcpu_create(unsigned int id)
 		goto out;
 	}
 
+    printk("vcpu_create: [%d] Allocated vcpu memory\n", id);
+
 	vcpu->cpu = -1;
 	vcpu->vcpu_id = id;
 
@@ -150,6 +152,8 @@ static struct svm_vcpu *vcpu_create(unsigned int id)
 	if (!vmcb_page)
 		goto free_vcpu;
 
+    printk("vcpu_create: [%d] Allocated vmcb memory\n", id);
+
 	msrpm_pages = alloc_pages(GFP_KERNEL, MSRPM_ALLOC_ORDER);
 	if (!msrpm_pages)
 		goto free_vmcb;
@@ -157,11 +161,15 @@ static struct svm_vcpu *vcpu_create(unsigned int id)
 	vcpu->msrpm = page_address(msrpm_pages);
 	memset(vcpu->msrpm, 0xff, PAGE_SIZE * (1 << MSRPM_ALLOC_ORDER));
 
+    printk("vcpu_create: [%d] Allocated MSR permissions bitmap memory\n", id);
+
 	vcpu->vmcb = page_address(vmcb_page);
 	clear_page(vcpu->vmcb);
 	vcpu->vmcb_pa = page_to_pfn(vmcb_page) << PAGE_SHIFT;
 	vcpu->asid_generation = 0;
 	vmcb_init(vcpu);
+
+    printk("vcpu_create: [%d] Initialized vmcb\n", id);
 
 	return vcpu;
 
@@ -620,11 +628,16 @@ static int vmrun_init(void)
 
 		struct svm_vcpu *vcpu = vcpu_create(i);
 
-		vcpu_setup(vcpu);
+        printk("vmrun_init: Created vcpu %d\n", i);
 
-		vcpu_run(vcpu);
+        vcpu_setup(vcpu);
+        printk("vmrun_init: Setup vcpu %d\n", i);
+
+		/*vcpu_run(vcpu);*/
+        /*printk("vmrun_init: Run vcpu %d\n", i);*/
 
 		vcpu_free(vcpu);
+        printk("vmrun_init: Freed vcpu %d\n", i);
 	}
 
 	svm_unsetup();
@@ -632,11 +645,11 @@ static int vmrun_init(void)
 	asm volatile("sti\n\t");
 
 finish_here:
-	printk("Done\n");
+	printk("vmrun_init: Done\n");
 	return 0;
 
 err:
-	printk("Error\n");
+	printk("vmrun_init: Error\n");
 	return r;
 }
 

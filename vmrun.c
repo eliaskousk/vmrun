@@ -449,15 +449,15 @@ static int svm_setup(void)
 	memset(iopm_va, 0xff, PAGE_SIZE * (1 << IOPM_ALLOC_ORDER));
 	iopm_base = page_to_pfn(iopm_pages) << PAGE_SHIFT;
 
-	asm volatile("rdmsr\n\t" : "=a" (msr_efer_value)
-			       : "c"  (msr_efer_addr)
-			       : "%rdx");
+	asm volatile("rdmsr\n\t" : "=A" (msr_efer_value)
+			         : "c"  (msr_efer_addr)
+			         :);
 
 	msr_efer_value |= (1 << MSR_EFER_SVM_EN_BIT);
 
 	asm volatile("wrmsr\n\t" :
-			       : "c" (msr_efer_addr), "a" (msr_efer_value)
-			       : "memory");
+			         : "c" (msr_efer_addr), "A" (msr_efer_value)
+			         :);
 
 	printk("Turned on MSR EFER.svme\n");
 
@@ -485,8 +485,8 @@ static int svm_setup(void)
 	cd->tss_desc = (struct ldttss_desc *)(gdt + GDT_ENTRY_TSS);
 
 	asm volatile("wrmsr\n\t" :
-			       : "c" (MSR_VM_HSAVE_PA), "a" (page_to_pfn(cd->save_area) << PAGE_SHIFT)
-			       : "memory");
+			       : "c" (MSR_VM_HSAVE_PA), "A" (page_to_pfn(cd->save_area) << PAGE_SHIFT)
+			       :);
 
 	return 0;
 
@@ -559,8 +559,8 @@ static int has_svm (void)
 	msr_vm_cr_addr  = MSR_VM_CR_SVM_DIS_ADDR;
 
 	asm volatile("rdmsr\n\t" : "=a" (msr_vm_cr_value)
-			       : "c"  (msr_vm_cr_addr)
-			       : "%rdx");
+			         : "c"  (msr_vm_cr_addr)
+			         : "%rdx");
 
 	if (!(msr_vm_cr_value & (1 << MSR_VM_CR_SVM_DIS_BIT)))
 		return 1;

@@ -55,9 +55,9 @@
 
 MODULE_LICENSE("Dual BSD/GPL");
 
-// static DEFINE_PER_CPU(struct svm_vcpu *, local_vcpu);
+static DEFINE_PER_CPU(struct svm_vcpu *, local_vcpu);
 static DEFINE_PER_CPU(struct svm_cpu_data *, local_cpu_data);
-// static DEFINE_PER_CPU(struct vmcb *, local_vmcb);
+static DEFINE_PER_CPU(struct vmcb *, local_vmcb);
 
 static unsigned long iopm_base;
 
@@ -129,11 +129,12 @@ static void vmcb_init(struct svm_vcpu *vcpu)
 	vcpu->regs[VCPU_REGS_RIP] = save->rip;
 }
 
-static struct svm_vcpu *vcpu_create(unsigned int id, unsigned int smp_id)
+static struct svm_vcpu *vcpu_create(unsigned int id)
 {
 	struct svm_vcpu *vcpu;
 	struct page *vmcb_page;
 	struct page *msrpm_pages;
+	int me = raw_smp_processor_id();
 	int err;
 
 	vcpu = kzalloc(sizeof(struct svm_vcpu), GFP_KERNEL);
@@ -142,9 +143,11 @@ static struct svm_vcpu *vcpu_create(unsigned int id, unsigned int smp_id)
 		goto out;
 	}
 
-    printk("vcpu_create: [%d] Allocated vcpu memory (cpu = %d)\n", id, smp_id);
+	per_cpu(local_vcpu, me);
 
-	vcpu->cpu = smp_id;
+	printk("vcpu_create: [%d] Allocated vcpu memory (cpu = %d)\n", id, me);
+
+	vcpu->cpu = me;
 	vcpu->vcpu_id = id;
 
 	err = -ENOMEM;
@@ -152,7 +155,7 @@ static struct svm_vcpu *vcpu_create(unsigned int id, unsigned int smp_id)
 	if (!vmcb_page)
 		goto free_vcpu;
 
-    printk("vcpu_create: [%d] Allocated vmcb memory\n", id);
+	printk("vcpu_create: [%d] Allocated vmcb memory\n", id);
 
 	msrpm_pages = alloc_pages(GFP_KERNEL, MSRPM_ALLOC_ORDER);
 	if (!msrpm_pages)
@@ -161,7 +164,7 @@ static struct svm_vcpu *vcpu_create(unsigned int id, unsigned int smp_id)
 	vcpu->msrpm = page_address(msrpm_pages);
 	memset(vcpu->msrpm, 0xff, PAGE_SIZE * (1 << MSRPM_ALLOC_ORDER));
 
-    printk("vcpu_create: [%d] Allocated MSR permissions bitmap memory\n", id);
+	printk("vcpu_create: [%d] Allocated MSR permissions bitmap memory\n", id);
 
 	vcpu->vmcb = page_address(vmcb_page);
 	clear_page(vcpu->vmcb);
@@ -169,7 +172,9 @@ static struct svm_vcpu *vcpu_create(unsigned int id, unsigned int smp_id)
 	vcpu->asid_generation = 0;
 	vmcb_init(vcpu);
 
-    printk("vcpu_create: [%d] Initialized vmcb\n", id);
+	per_cpu(local_vmcb, me);
+
+	printk("vcpu_create: [%d] Initialized vmcb\n", id);
 
 	return vcpu;
 
@@ -629,16 +634,14 @@ static int vmrun_init(void)
 
 	for (unsigned int i = 0; i < NR_VCPUS; i++) {
 
-		unsigned int smp_id = raw_smp_processor_id();
-
-        struct svm_vcpu *vcpu = vcpu_create(i, smp_id);
-        printk("vmrun_init: Created vcpu %d\n", i);
-        /*vcpu_setup(vcpu);*/
-        /*printk("vmrun_init: Setup vcpu %d\n", i);*/
-        /*vcpu_run(vcpu);*/
-        /*printk("vmrun_init: Run vcpu %d\n", i);*/
-        vcpu_free(vcpu);
-        printk("vmrun_init: Freed vcpu %d\n", i);
+		struct svm_vcpu *vcpu = vcpu_create(i);
+		printk("vmrun_init: Created vcpu %d\n", i);
+		/*vcpu_setup(vcpu);*/
+		/*printk("vmrun_init: Setup vcpu %d\n", i);*/
+		/*vcpu_run(vcpu);*/
+		/*printk("vmrun_init: Run vcpu %d\n", i);*/
+		vcpu_free(vcpu);
+		printk("vmrun_init: Freed vcpu %d\n", i);
 	}
 
 	svm_unsetup();

@@ -632,11 +632,11 @@ static int vmrun_init(void)
 	asm volatile("sti\n\t");
 
 finish_here:
-	printk("Done\n\t");
+	printk("Done\n");
 	return 0;
 
 err:
-	printk("Error\n\t");
+	printk("Error\n");
 	return r;
 }
 

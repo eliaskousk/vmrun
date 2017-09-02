@@ -82,8 +82,10 @@ static void vmcb_init(struct svm_vcpu *vcpu)
 {
 	struct vmcb_control_area *control = &vcpu->vmcb->control;
 	struct vmcb_save_area *save = &vcpu->vmcb->save;
-	unsigned long cr0 = 0;
+	unsigned long cr0 = X86_CR0_NW | X86_CR0_CD | X86_CR0_ET;
 
+	control->intercept |= (1ULL << INTERCEPT_INTR);
+	control->intercept |= (1ULL << INTERCEPT_VMRUN);   // Needed?
 	control->intercept |= (1ULL << INTERCEPT_VMMCALL);
 	control->clean &= ~(1 << VMCB_INTERCEPTS);
 
@@ -110,25 +112,21 @@ static void vmcb_init(struct svm_vcpu *vcpu)
 	init_sys_seg(&save->ldtr, SEG_TYPE_LDT);
 	init_sys_seg(&save->tr, SEG_TYPE_BUSY_TSS16);
 
-	save->efer = vcpu->efer | EFER_SVME | EFER_LMA | EFER_LME;
-	control->clean &= ~(1 << VMCB_CR);
-
-	save->dr6 = 0xffff0ff0;
-	save->rflags = 2;
 	save->rip = 0x0000fff0;
+	save->rflags = 2;
+	save->dr6 = 0xffff0ff0;
 
-	cr0 = X86_CR0_NW | X86_CR0_CD | X86_CR0_ET | X86_CR0_PG | X86_CR0_WP;
-	save->cr0 = cr0;
-	control->clean &= ~(1 << VMCB_CR);
+	save->efer = EFER_SVME;
+	save->cr0 = cr0 | X86_CR0_PG | X86_CR0_WP;
 	save->cr4 = X86_CR4_PAE;
+	control->clean &= ~(1 << VMCB_CR);
 	control->clean = 0;
 
 	vcpu->cr0 = cr0;
-	vcpu->efer = EFER_LME | EFER_LMA;
-	vcpu->regs[VCPU_REGS_RIP] = save->rip;
-	vcpu->hflags = 0;
-	vcpu->asid_generation = 0;
+	vcpu->efer = 0;
 	vcpu->hflags |= HF_GIF_MASK;
+	vcpu->asid_generation = 0;
+	vcpu->regs[VCPU_REGS_RIP] = save->rip;
 }
 
 static struct svm_vcpu *vcpu_create(unsigned int id)
@@ -175,17 +173,128 @@ out:
 	return ERR_PTR(err);
 }
 
+static void vcpu_setup(struct svm_vcpu *vcpu)
+{
+	u64 gdt_base, idt_base, tr_base, tr_base_lo, tr_base_hi, tr_base_real;
+	u32 gdt_limit, idt_limit, fs_gs_base_low, fs_gs_base_hi;
+	u16 attr_cs, attr_ss, attr_tr;
+
+	asm volatile("movw %%cs, %%ax\n"  : "=a" (vcpu->vmcb->save.cs.selector));
+	asm volatile("lar %%eax, %%eax\n" : "=a" (attr_cs) : "a" (vcpu->vmcb->save.cs.selector));
+	asm volatile("movw %%ss, %%ax\n"  : "=a" (vcpu->vmcb->save.ss.selector));
+	asm volatile("lar %%eax, %%eax\n" : "=a" (attr_ss) : "a" (vcpu->vmcb->save.ss.selector));
+	asm volatile("movw %%es, %%ax\n"  : "=a" (vcpu->vmcb->save.es.selector));
+	asm volatile("movw %%ds, %%ax\n"  : "=a" (vcpu->vmcb->save.ds.selector));
+	asm volatile("movw %%fs, %%ax\n"  : "=a" (vcpu->vmcb->save.fs.selector));
+	asm volatile("movw %%gs, %%ax\n"  : "=a" (vcpu->vmcb->save.gs.selector));
+	asm volatile("sldt %%ax\n"        : "=a" (vcpu->vmcb->save.ldtr.selector));
+	asm volatile("str %%ax\n"         : "=a" (vcpu->vmcb->save.tr.selector));
+	asm volatile("lar %%eax,%%eax\n"  : "=a" (attr_tr) :"a"(vcpu->vmcb->save.tr.selector));
+	asm volatile("lsl %%eax, %%eax\n" : "=a" (vcpu->vmcb->save.tr.limit));
+
+	vcpu->vmcb->save.cs.limit    = 0xffffffff;
+	vcpu->vmcb->save.ss.limit    = 0xffffffff;
+	vcpu->vmcb->save.es.limit    = 0xffffffff;
+	vcpu->vmcb->save.ds.limit    = 0xffffffff;
+	vcpu->vmcb->save.fs.limit    = 0xffffffff;
+	vcpu->vmcb->save.gs.limit    = 0xffffffff;
+	vcpu->vmcb->save.ldtr.limit  = 0x0;
+
+	vcpu->vmcb->save.tr.attrib   = attr_tr >> 8;
+	vcpu->vmcb->save.cs.attrib   = attr_cs >> 8;
+	vcpu->vmcb->save.ss.attrib   = attr_ss >> 8;
+	vcpu->vmcb->save.es.attrib   = 0x000;
+	vcpu->vmcb->save.ds.attrib   = 0x000;
+	vcpu->vmcb->save.fs.attrib   = 0x000;
+	vcpu->vmcb->save.gs.attrib   = 0x000;
+	vcpu->vmcb->save.ldtr.attrib = 0x000;
+
+	asm volatile("sgdt %0\n" : : "m" (gdt_base));
+	gdt_limit = (u32)gdt_base & 0xffff;
+	gdt_base  = gdt_base >> 16; //base
+
+	if((gdt_base >> 47 & 0x1)) {
+		gdt_base |= 0xffff000000000000ull;
+	}
+
+	vcpu->vmcb->save.gdtr.base  = gdt_base;
+	vcpu->vmcb->save.gdtr.limit = gdt_limit;
+
+	asm volatile("sidt %0\n" : : "m" (idt_base));
+	idt_limit = (u32)idt_base & 0xffff;
+	idt_base  = idt_base >> 16; //base
+
+	if((idt_base >> 47 & 0x1)) {
+		idt_base |= 0xffff000000000000ull;
+	}
+
+	vcpu->vmcb->save.idtr.base  = idt_base;
+	vcpu->vmcb->save.idtr.limit = idt_limit;
+
+	tr_base = gdt_base + vcpu->vmcb->save.tr.selector;
+	if((tr_base >> 47 & 0x1)) {
+		tr_base |= 0xffff000000000000ull;
+	}
+
+	// SS segment override
+	asm volatile("mov %0,%%rax\n"
+		    ".byte 0x36\n"
+		    "movq (%%rax), %%rax\n" : "=a" (tr_base_lo) : "0" (tr_base));
+
+	tr_base_real = ((tr_base_lo  >> 16) & (0x0ffff)) |
+		       (((tr_base_lo >> 32) & 0x000000ff) << 16) |
+		       (((tr_base_lo >> 56) & 0xff) << 24);
+
+	// SS segment override for upper32 bits of base in ia32e mode
+	asm volatile("mov %0,%%rax\n"
+		     ".byte 0x36\n"
+		     "movq 8(%%rax),%%rax\n" : "=a" (tr_base_hi) : "0" (tr_base));
+
+	vcpu->vmcb->save.tr.base = tr_base_real | (tr_base_hi << 32);
+
+	asm volatile("movq %%cr0, %%rax\n" :"=a"(vcpu->vmcb->save.cr0));
+	asm volatile("movq %%cr3, %%rax\n" :"=a"(vcpu->vmcb->save.cr3));
+	asm volatile("movq %%cr4, %%rax\n" :"=a"(vcpu->vmcb->save.cr4));
+
+	asm volatile("mov $0xc0000100, %rcx\n");
+	asm volatile("rdmsr\n" :"=a"(fs_gs_base_low) : :"%rdx");
+	asm volatile ("shl $32, %%rdx\n" :"=d"(fs_gs_base_hi));
+	vcpu->vmcb->save.fs.base = fs_gs_base_hi | fs_gs_base_low;
+	asm volatile("mov $0xc0000101, %rcx\n");
+	asm volatile("rdmsr\n" :"=a"(fs_gs_base_low) : :"%rdx");
+	asm volatile ("shl $32, %%rdx\n" :"=d"(fs_gs_base_hi));
+	vcpu->vmcb->save.gs.base = fs_gs_base_hi | fs_gs_base_low;
+
+	vcpu->vmcb->save.dr7 = 0x400;
+
+	asm ("movq %%rsp, %%rax\n" :"=a"(vcpu->vmcb->save.rsp));
+
+	asm volatile("movq $guest_entry_point, %rax");
+	asm volatile("movq %%rax, %0" : "=r" (vcpu->vmcb->save.rip));
+	vcpu->regs[VCPU_REGS_RIP] = vcpu->vmcb->save.rip;
+
+	asm volatile("pushfq\n");
+	asm volatile("popq %0\n" : "=m"(vcpu->vmcb->save.rflags) : : "memory");
+
+	asm volatile("mov $0x174, %rcx\n");
+	asm("rdmsr\n");
+	asm("mov %%rax, %0\n" : : "m" (vcpu->vmcb->save.sysenter_cs) : "memory");
+
+	asm volatile("mov $0x175, %rcx\n");
+	asm("rdmsr\n");
+	asm("mov %%rax, %0\n" : : "m" (vcpu->vmcb->save.sysenter_eip) : "memory");
+	asm("or %0, %%rdx\n"  : : "m" (vcpu->vmcb->save.sysenter_eip) : "memory");
+
+	asm volatile("mov $0x176, %rcx\n");
+	asm("rdmsr\n");
+	asm("mov %%rax, %0\n" : : "m" (vcpu->vmcb->save.sysenter_esp) : "memory");
+	asm("or %0, %%rdx\n"  : : "m" (vcpu->vmcb->save.sysenter_esp) : "memory");
+
+	vcpu->vmcb->control.clean = 0;
+}
+
 static void vcpu_run(struct svm_vcpu *vcpu)
 {
-	// Guest rip
-	asm volatile("movq $guest_entry_point, %rax");
-	asm volatile("movq %%rax, %0" : "=r" (vcpu->vmcb->save.rip)
-			              :
-				      : "memory");
-	asm ("movq %%rax, %0" : "=r" (vcpu->regs[VCPU_REGS_RIP])
-			      :
-			      : "memory");
-
 	printk("Doing vmrun now...\n");
 
 	asm volatile(
@@ -486,8 +595,6 @@ static int vmrun_init(void)
 		printk("SVM not supported or enabled on CPU, nothing to be done\n");
 		goto finish_here;
 	}
-	
-	asm volatile("cli\n");
 
 	r = svm_setup();
 	if (r)
@@ -496,6 +603,8 @@ static int vmrun_init(void)
 	for (unsigned int i = 0; i < NR_VCPUS; i++) {
 
 		struct svm_vcpu *vcpu = vcpu_create(i);
+
+		vcpu_setup(vcpu);
 
 		vcpu_run(vcpu);
 

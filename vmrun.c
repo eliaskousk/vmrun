@@ -269,10 +269,6 @@ static void vcpu_setup(struct svm_vcpu *vcpu)
 
 	asm ("movq %%rsp, %%rax\n\t" :"=a"(vcpu->vmcb->save.rsp));
 
-	asm volatile("movq $guest_entry_point, %rax\n\t");
-	asm volatile("movq %%rax, %0\n\t" : "=r" (vcpu->vmcb->save.rip));
-	vcpu->regs[VCPU_REGS_RIP] = vcpu->vmcb->save.rip;
-
 	asm volatile("pushfq\n\t");
 	asm volatile("popq %0\n\t" : "=m"(vcpu->vmcb->save.rflags) : : "memory");
 
@@ -296,6 +292,10 @@ static void vcpu_setup(struct svm_vcpu *vcpu)
 static void vcpu_run(struct svm_vcpu *vcpu)
 {
 	printk("Doing vmrun now...\n\t");
+
+	asm volatile("movq $guest_entry_point, %rax\n\t");
+	asm volatile("movq %%rax, %0\n\t" : "=r" (vcpu->vmcb->save.rip));
+	vcpu->regs[VCPU_REGS_RIP] = vcpu->vmcb->save.rip;
 
 	asm volatile(
 		INSTR_SVM_CLGI "\n\t"

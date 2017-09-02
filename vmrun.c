@@ -469,7 +469,7 @@ static int current_cpu_setup(void)
 	gdt = this_cpu_ptr(&gdt_page)->gdt;
 	cd->tss_desc = (struct ldttss_desc *)(gdt + GDT_ENTRY_TSS);
 
-	printk("svm_setup: Registered TSS descriptor");
+	printk("current_cpu_setup: Registered TSS descriptor");
 
 	asm volatile("wrmsr\n\t" :
 				 : "c" (MSR_VM_HSAVE_PA), "A" (page_to_pfn(cd->save_area) << PAGE_SHIFT)

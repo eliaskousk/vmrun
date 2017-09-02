@@ -417,6 +417,8 @@ static int local_cpu_init(int cpu)
 
 	per_cpu(local_cpu_data, cpu) = cd;
 
+	printk("local_cpu_init: [%d] Initialized cpu\n", cpu);
+
 	return 0;
 
 err:

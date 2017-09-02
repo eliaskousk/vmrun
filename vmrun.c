@@ -129,7 +129,7 @@ static void vmcb_init(struct svm_vcpu *vcpu)
 	vcpu->regs[VCPU_REGS_RIP] = save->rip;
 }
 
-static struct svm_vcpu *vcpu_create(unsigned int id)
+static struct svm_vcpu *vcpu_create(unsigned int id, unsigned int smp_id)
 {
 	struct svm_vcpu *vcpu;
 	struct page *vmcb_page;
@@ -142,9 +142,9 @@ static struct svm_vcpu *vcpu_create(unsigned int id)
 		goto out;
 	}
 
-    printk("vcpu_create: [%d] Allocated vcpu memory\n", id);
+    printk("vcpu_create: [%d] Allocated vcpu memory (cpu = %d)\n", id, smp_id);
 
-	vcpu->cpu = -1;
+	vcpu->cpu = smp_id;
 	vcpu->vcpu_id = id;
 
 	err = -ENOMEM;
@@ -628,32 +628,13 @@ static int vmrun_init(void)
 
 		unsigned int smp_id = raw_smp_processor_id();
 
-		if (smp_id == i % num_online_cpus()) {
-
-			struct svm_vcpu *vcpu = vcpu_create(i);
-			printk("vmrun_init: Created vcpu %d\n", i);
-			vcpu_setup(vcpu);
-			printk("vmrun_init: Setup vcpu %d\n", i);
-			/*vcpu_run(vcpu);*/
-			/*printk("vmrun_init: Run vcpu %d\n", i);*/
-			vcpu_free(vcpu);
-			printk("vmrun_init: Freed vcpu %d\n", i);
-		}
-	}
-
-	for (unsigned int i = 0; i < NR_VCPUS; i++) {
-
-		struct svm_vcpu *vcpu = vcpu_create(i);
-
-
-
-        vcpu_setup(vcpu);
-
-
-		/*vcpu_run(vcpu);*/
+        struct svm_vcpu *vcpu = vcpu_create(i, smp_id);
+        printk("vmrun_init: Created vcpu %d\n", i);
+        /*vcpu_setup(vcpu);*/
+        /*printk("vmrun_init: Setup vcpu %d\n", i);*/
+        /*vcpu_run(vcpu);*/
         /*printk("vmrun_init: Run vcpu %d\n", i);*/
-
-		vcpu_free(vcpu);
+        vcpu_free(vcpu);
         printk("vmrun_init: Freed vcpu %d\n", i);
 	}
 

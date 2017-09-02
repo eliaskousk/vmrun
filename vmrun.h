@@ -33,7 +33,7 @@
 #define MSR_VM_CR_SVM_DIS_ADDR    0xc0010114
 #define MSR_VM_CR_SVM_DIS_BIT     0x4
 #define MSR_EFER_SVM_EN_ADDR      0xc0000080
-#define MSR_EFER_SVM_EN_BIT       0x12
+#define MSR_EFER_SVM_EN_BIT       0xC
 #define MSR_VM_HSAVE_PA           0xc0010117
 
 #define HF_GIF_MASK		  (1 << 0)

@@ -81,17 +81,17 @@ static void init_sys_seg(struct vmcb_seg *seg, uint32_t type)
 static void vmcb_init(struct svm_vcpu *vcpu)
 {
 	struct vmcb_control_area *control = &vcpu->vmcb->control;
-	struct vmcb_save_area *save = &vcpu->vmcb->save;
+	struct vmcb_save_area    *save    = &vcpu->vmcb->save;
 	unsigned long cr0 = X86_CR0_NW | X86_CR0_CD | X86_CR0_ET;
 
 	control->intercept |= (1ULL << INTERCEPT_INTR);
 	control->intercept |= (1ULL << INTERCEPT_VMRUN);   // Needed?
 	control->intercept |= (1ULL << INTERCEPT_VMMCALL);
-	control->clean &= ~(1 << VMCB_INTERCEPTS);
+	control->clean     &= ~(1 << VMCB_INTERCEPTS);
 
-	control->iopm_base_pa = iopm_base;
+	control->iopm_base_pa  = iopm_base;
 	control->msrpm_base_pa = __pa(vcpu->msrpm);
-	control->int_ctl = V_INTR_MASK;
+	control->int_ctl       = V_INTR_MASK;
 
 	init_seg(&save->es);
 	init_seg(&save->ss);
@@ -143,8 +143,6 @@ static struct svm_vcpu *vcpu_create(unsigned int id)
 		goto out;
 	}
 
-	per_cpu(local_vcpu, me);
-
 	printk("vcpu_create: [%d] Allocated vcpu memory (cpu = %d)\n", id, me);
 
 	vcpu->cpu = me;
@@ -172,9 +170,11 @@ static struct svm_vcpu *vcpu_create(unsigned int id)
 	vcpu->asid_generation = 0;
 	vmcb_init(vcpu);
 
-	per_cpu(local_vmcb, me);
-
 	printk("vcpu_create: [%d] Initialized vmcb\n", id);
+
+	vcpu->cpu_data = per_cpu(local_cpu_data, me);
+	per_cpu(local_vcpu, me) = vcpu;
+	per_cpu(local_vmcb, me) = vcpu->vmcb;
 
 	return vcpu;
 
@@ -420,8 +420,6 @@ static int local_cpu_init(int cpu)
 	if (!cd->save_area)
 		goto err;
 
-	per_cpu(local_cpu_data, cpu) = cd;
-
 	printk("local_cpu_init: [%d] Initialized cpu\n", cpu);
 
 	return 0;
@@ -483,16 +481,16 @@ static int svm_setup(void)
 		r = local_cpu_init(cpu);
 		if (r)
 			goto err;
-
-		cd = per_cpu(local_cpu_data, cpu);
-		if (!cd) {
-			pr_err("%s: cpu_data is NULL on %d\n", __func__, cpu);
-			r = -EINVAL;
-			goto err;
-		}
 	}
 
 	printk("svm_setup: Allocated local CPU data");
+
+	cd = per_cpu(local_cpu_data, cpu);
+	if (!cd) {
+		pr_err("%s: cpu_data is NULL on %d\n", __func__, cpu);
+		r = -EINVAL;
+		goto err;
+	}
 
 	cd->asid_generation = 1;
 	asm volatile("cpuid\n\t" : "=b" (cd->max_asid)

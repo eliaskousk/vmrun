@@ -428,14 +428,16 @@ err:
 
 static void local_cpu_uninit(int cpu)
 {
-	struct svm_cpu_data *cd = per_cpu(local_cpu_data, raw_smp_processor_id());
+	struct svm_cpu_data *cd = per_cpu(local_cpu_data, cpu);
 
 	if (!cd)
 		return;
 
-	per_cpu(local_cpu_data, raw_smp_processor_id()) = NULL;
+	per_cpu(local_cpu_data, cpu) = NULL;
 	__free_page(cd->save_area);
 	kfree(cd);
+
+	printk("local_cpu_init: [%d] Unitialized cpu\n", cpu);
 }
 
 static int svm_setup(void)
@@ -443,7 +445,6 @@ static int svm_setup(void)
 	int msr_efer_addr  = MSR_EFER_SVM_EN_ADDR;
 	int msr_efer_value = 0;
 	struct svm_cpu_data *cd;
-	int me = raw_smp_processor_id();
 	struct desc_struct *gdt;
 	struct page *iopm_pages;
 	void *iopm_va;
@@ -477,16 +478,16 @@ static int svm_setup(void)
 		r = local_cpu_init(cpu);
 		if (r)
 			goto err;
+
+		cd = per_cpu(local_cpu_data, cpu);
+		if (!cd) {
+			pr_err("%s: cpu_data is NULL on %d\n", __func__, cpu);
+			r = -EINVAL;
+			goto err;
+		}
 	}
 
 	printk("svm_setup: Allocated local CPU data");
-
-	cd = per_cpu(local_cpu_data, me);
-	if (!cd) {
-		pr_err("%s: cpu_data is NULL on %d\n", __func__, me);
-		r = -EINVAL;
-		goto err;
-	}
 
 	cd->asid_generation = 1;
 	asm volatile("cpuid\n\t" : "=b" (cd->max_asid)

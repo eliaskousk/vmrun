@@ -461,7 +461,7 @@ static int svm_setup(void)
 			         : "c" (msr_efer_addr), "A" (msr_efer_value)
 			         :);
 
-	printk("Turned on MSR EFER.svme\n");
+	printk("svm_setup: Turned on MSR EFER.svme\n");
 
 	for_each_possible_cpu(cpu) {
 		r = local_cpu_init(cpu);
@@ -516,12 +516,12 @@ static void svm_unsetup(void)
 			         : "c" (MSR_VM_HSAVE_PA), "A" (0)
 			         :);
 
-	printk("svm_setup: Unregistered host save area");
+	printk("svm_unsetup: Unregistered host save area");
 
 	for_each_possible_cpu(cpu)
 		local_cpu_uninit(cpu);
 
-	printk("svm_setup: Freed local CPU data");
+	printk("svm_unsetup: Freed local CPU data");
 
 	asm volatile("rdmsr\n\t" : "=A" (msr_efer_value)
 			       : "c"  (msr_efer_addr)
@@ -533,12 +533,12 @@ static void svm_unsetup(void)
 			         : "c" (msr_efer_addr), "A" (msr_efer_value)
 			         :);
 
-	printk("Turned off MSR EFER.svme\n");
+	printk("svm_unsetup: Turned off MSR EFER.svme\n");
 
 	__free_pages(pfn_to_page(iopm_base >> PAGE_SHIFT), IOPM_ALLOC_ORDER);
 	iopm_base = 0;
 
-	printk("svm_setup: Freed I/O permission map");
+	printk("svm_unsetup: Freed I/O permission map");
 }
 
 static int has_svm (void)

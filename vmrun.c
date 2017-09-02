@@ -179,18 +179,18 @@ static void vcpu_setup(struct svm_vcpu *vcpu)
 	u32 gdt_limit, idt_limit, fs_gs_base_low, fs_gs_base_hi;
 	u16 attr_cs, attr_ss, attr_tr;
 
-	asm volatile("movw %%cs, %%ax\n"  : "=a" (vcpu->vmcb->save.cs.selector));
-	asm volatile("lar %%eax, %%eax\n" : "=a" (attr_cs) : "a" (vcpu->vmcb->save.cs.selector));
-	asm volatile("movw %%ss, %%ax\n"  : "=a" (vcpu->vmcb->save.ss.selector));
-	asm volatile("lar %%eax, %%eax\n" : "=a" (attr_ss) : "a" (vcpu->vmcb->save.ss.selector));
-	asm volatile("movw %%es, %%ax\n"  : "=a" (vcpu->vmcb->save.es.selector));
-	asm volatile("movw %%ds, %%ax\n"  : "=a" (vcpu->vmcb->save.ds.selector));
-	asm volatile("movw %%fs, %%ax\n"  : "=a" (vcpu->vmcb->save.fs.selector));
-	asm volatile("movw %%gs, %%ax\n"  : "=a" (vcpu->vmcb->save.gs.selector));
-	asm volatile("sldt %%ax\n"        : "=a" (vcpu->vmcb->save.ldtr.selector));
-	asm volatile("str %%ax\n"         : "=a" (vcpu->vmcb->save.tr.selector));
-	asm volatile("lar %%eax,%%eax\n"  : "=a" (attr_tr) :"a"(vcpu->vmcb->save.tr.selector));
-	asm volatile("lsl %%eax, %%eax\n" : "=a" (vcpu->vmcb->save.tr.limit));
+	asm volatile("movw %%cs, %%ax\n\t"  : "=a" (vcpu->vmcb->save.cs.selector));
+	asm volatile("lar %%eax, %%eax\n\t" : "=a" (attr_cs) : "a" (vcpu->vmcb->save.cs.selector));
+	asm volatile("movw %%ss, %%ax\n\t"  : "=a" (vcpu->vmcb->save.ss.selector));
+	asm volatile("lar %%eax, %%eax\n\t" : "=a" (attr_ss) : "a" (vcpu->vmcb->save.ss.selector));
+	asm volatile("movw %%es, %%ax\n\t"  : "=a" (vcpu->vmcb->save.es.selector));
+	asm volatile("movw %%ds, %%ax\n\t"  : "=a" (vcpu->vmcb->save.ds.selector));
+	asm volatile("movw %%fs, %%ax\n\t"  : "=a" (vcpu->vmcb->save.fs.selector));
+	asm volatile("movw %%gs, %%ax\n\t"  : "=a" (vcpu->vmcb->save.gs.selector));
+	asm volatile("sldt %%ax\n\t"        : "=a" (vcpu->vmcb->save.ldtr.selector));
+	asm volatile("str %%ax\n\t"         : "=a" (vcpu->vmcb->save.tr.selector));
+	asm volatile("lar %%eax,%%eax\n\t"  : "=a" (attr_tr) :"a"(vcpu->vmcb->save.tr.selector));
+	asm volatile("lsl %%eax, %%eax\n\t" : "=a" (vcpu->vmcb->save.tr.limit));
 
 	vcpu->vmcb->save.cs.limit    = 0xffffffff;
 	vcpu->vmcb->save.ss.limit    = 0xffffffff;
@@ -209,7 +209,7 @@ static void vcpu_setup(struct svm_vcpu *vcpu)
 	vcpu->vmcb->save.gs.attrib   = 0x000;
 	vcpu->vmcb->save.ldtr.attrib = 0x000;
 
-	asm volatile("sgdt %0\n" : : "m" (gdt_base));
+	asm volatile("sgdt %0\n\t" : : "m" (gdt_base));
 	gdt_limit = (u32)gdt_base & 0xffff;
 	gdt_base  = gdt_base >> 16; //base
 
@@ -220,7 +220,7 @@ static void vcpu_setup(struct svm_vcpu *vcpu)
 	vcpu->vmcb->save.gdtr.base  = gdt_base;
 	vcpu->vmcb->save.gdtr.limit = gdt_limit;
 
-	asm volatile("sidt %0\n" : : "m" (idt_base));
+	asm volatile("sidt %0\n\t" : : "m" (idt_base));
 	idt_limit = (u32)idt_base & 0xffff;
 	idt_base  = idt_base >> 16; //base
 
@@ -237,65 +237,65 @@ static void vcpu_setup(struct svm_vcpu *vcpu)
 	}
 
 	// SS segment override
-	asm volatile("mov %0,%%rax\n"
-		    ".byte 0x36\n"
-		    "movq (%%rax), %%rax\n" : "=a" (tr_base_lo) : "0" (tr_base));
+	asm volatile("mov %0,%%rax\n\t"
+		    ".byte 0x36\n\t"
+		    "movq (%%rax), %%rax\n\t" : "=a" (tr_base_lo) : "0" (tr_base));
 
 	tr_base_real = ((tr_base_lo  >> 16) & (0x0ffff)) |
 		       (((tr_base_lo >> 32) & 0x000000ff) << 16) |
 		       (((tr_base_lo >> 56) & 0xff) << 24);
 
 	// SS segment override for upper32 bits of base in ia32e mode
-	asm volatile("mov %0,%%rax\n"
-		     ".byte 0x36\n"
-		     "movq 8(%%rax),%%rax\n" : "=a" (tr_base_hi) : "0" (tr_base));
+	asm volatile("mov %0,%%rax\n\t"
+		     ".byte 0x36\n\t"
+		     "movq 8(%%rax),%%rax\n\t" : "=a" (tr_base_hi) : "0" (tr_base));
 
 	vcpu->vmcb->save.tr.base = tr_base_real | (tr_base_hi << 32);
 
-	asm volatile("movq %%cr0, %%rax\n" :"=a"(vcpu->vmcb->save.cr0));
-	asm volatile("movq %%cr3, %%rax\n" :"=a"(vcpu->vmcb->save.cr3));
-	asm volatile("movq %%cr4, %%rax\n" :"=a"(vcpu->vmcb->save.cr4));
+	asm volatile("movq %%cr0, %%rax\n\t" :"=a"(vcpu->vmcb->save.cr0));
+	asm volatile("movq %%cr3, %%rax\n\t" :"=a"(vcpu->vmcb->save.cr3));
+	asm volatile("movq %%cr4, %%rax\n\t" :"=a"(vcpu->vmcb->save.cr4));
 
-	asm volatile("mov $0xc0000100, %rcx\n");
-	asm volatile("rdmsr\n" :"=a"(fs_gs_base_low) : :"%rdx");
-	asm volatile ("shl $32, %%rdx\n" :"=d"(fs_gs_base_hi));
+	asm volatile("mov $0xc0000100, %rcx\n\t");
+	asm volatile("rdmsr\n\t" :"=a"(fs_gs_base_low) : :"%rdx");
+	asm volatile ("shl $32, %%rdx\n\t" :"=d"(fs_gs_base_hi));
 	vcpu->vmcb->save.fs.base = fs_gs_base_hi | fs_gs_base_low;
-	asm volatile("mov $0xc0000101, %rcx\n");
-	asm volatile("rdmsr\n" :"=a"(fs_gs_base_low) : :"%rdx");
-	asm volatile ("shl $32, %%rdx\n" :"=d"(fs_gs_base_hi));
+	asm volatile("mov $0xc0000101, %rcx\n\t");
+	asm volatile("rdmsr\n\t" :"=a"(fs_gs_base_low) : :"%rdx");
+	asm volatile ("shl $32, %%rdx\n\t" :"=d"(fs_gs_base_hi));
 	vcpu->vmcb->save.gs.base = fs_gs_base_hi | fs_gs_base_low;
 
 	vcpu->vmcb->save.dr7 = 0x400;
 
-	asm ("movq %%rsp, %%rax\n" :"=a"(vcpu->vmcb->save.rsp));
+	asm ("movq %%rsp, %%rax\n\t" :"=a"(vcpu->vmcb->save.rsp));
 
-	asm volatile("movq $guest_entry_point, %rax");
-	asm volatile("movq %%rax, %0" : "=r" (vcpu->vmcb->save.rip));
+	asm volatile("movq $guest_entry_point, %rax\n\t");
+	asm volatile("movq %%rax, %0\n\t" : "=r" (vcpu->vmcb->save.rip));
 	vcpu->regs[VCPU_REGS_RIP] = vcpu->vmcb->save.rip;
 
-	asm volatile("pushfq\n");
-	asm volatile("popq %0\n" : "=m"(vcpu->vmcb->save.rflags) : : "memory");
+	asm volatile("pushfq\n\t");
+	asm volatile("popq %0\n\t" : "=m"(vcpu->vmcb->save.rflags) : : "memory");
 
-	asm volatile("mov $0x174, %rcx\n");
-	asm("rdmsr\n");
-	asm("mov %%rax, %0\n" : : "m" (vcpu->vmcb->save.sysenter_cs) : "memory");
+	asm volatile("mov $0x174, %rcx\n\t");
+	asm("rdmsr\n\t");
+	asm("mov %%rax, %0\n\t" : : "m" (vcpu->vmcb->save.sysenter_cs) : "memory");
 
-	asm volatile("mov $0x175, %rcx\n");
-	asm("rdmsr\n");
-	asm("mov %%rax, %0\n" : : "m" (vcpu->vmcb->save.sysenter_eip) : "memory");
-	asm("or %0, %%rdx\n"  : : "m" (vcpu->vmcb->save.sysenter_eip) : "memory");
+	asm volatile("mov $0x175, %rcx\n\t");
+	asm("rdmsr\n\t");
+	asm("mov %%rax, %0\n\t" : : "m" (vcpu->vmcb->save.sysenter_eip) : "memory");
+	asm("or %0, %%rdx\n\t"  : : "m" (vcpu->vmcb->save.sysenter_eip) : "memory");
 
-	asm volatile("mov $0x176, %rcx\n");
-	asm("rdmsr\n");
-	asm("mov %%rax, %0\n" : : "m" (vcpu->vmcb->save.sysenter_esp) : "memory");
-	asm("or %0, %%rdx\n"  : : "m" (vcpu->vmcb->save.sysenter_esp) : "memory");
+	asm volatile("mov $0x176, %rcx\n\t");
+	asm("rdmsr\n\t");
+	asm("mov %%rax, %0\n\t" : : "m" (vcpu->vmcb->save.sysenter_esp) : "memory");
+	asm("or %0, %%rdx\n\t"  : : "m" (vcpu->vmcb->save.sysenter_esp) : "memory");
 
 	vcpu->vmcb->control.clean = 0;
 }
 
 static void vcpu_run(struct svm_vcpu *vcpu)
 {
-	printk("Doing vmrun now...\n");
+	printk("Doing vmrun now...\n\t");
 
 	asm volatile(
 		INSTR_SVM_CLGI "\n\t"
@@ -362,19 +362,19 @@ static void vcpu_run(struct svm_vcpu *vcpu)
 		: "cc", "memory", "rbx", "rcx", "rdx", "rsi", "rdi",
 		  "r8", "r9", "r10", "r11" , "r12", "r13", "r14", "r15");
 
-	printk("After #vmexit\n");
-	asm volatile("jmp vmexit_handler\n");
-	asm volatile("nop\n"); //will never get here
+	printk("After #vmexit\n\t");
+	asm volatile("jmp vmexit_handler\n\t");
+	asm volatile("nop\n\t"); //will never get here
 
 	asm volatile("guest_entry_point:");
 	asm volatile(INSTR_SVM_VMMCALL);
-	asm volatile("ud2\n"); //will never get here
+	asm volatile("ud2\n\t"); //will never get here
 
 	asm volatile("vmexit_handler:\n");
 	printk("Guest #vmexit Info\n");
-	printk("Code: 0x%x\n", vcpu->vmcb->control.exit_code);
-	printk("Info 1: 0x%llx\n", vcpu->vmcb->control.exit_info_1);
-	printk("Info 2: 0x%llx\n", vcpu->vmcb->control.exit_info_2);
+	printk("Code: 0x%x\n\t", vcpu->vmcb->control.exit_code);
+	printk("Info 1: 0x%llx\n\t", vcpu->vmcb->control.exit_info_1);
+	printk("Info 2: 0x%llx\n\t", vcpu->vmcb->control.exit_info_2);
 
 	if (vcpu->vmcb->control.exit_code == SVM_EXIT_ERR) {
 		pr_err("VMRUN Failed\n");
@@ -382,7 +382,7 @@ static void vcpu_run(struct svm_vcpu *vcpu)
 	}
 
 	if (vcpu->vmcb->control.exit_code == SVM_EXIT_VMMCALL) {
-		printk("VMRUN and VMMCALL Succeeded\b");
+		printk("VMRUN and VMMCALL Succeeded\n");
 		vcpu->next_rip = vcpu->regs[VCPU_REGS_RIP] + 3;
 	}
 }
@@ -449,13 +449,13 @@ static int svm_setup(void)
 	memset(iopm_va, 0xff, PAGE_SIZE * (1 << IOPM_ALLOC_ORDER));
 	iopm_base = page_to_pfn(iopm_pages) << PAGE_SHIFT;
 
-	asm volatile("rdmsr\n" : "=a" (msr_efer_value)
+	asm volatile("rdmsr\n\t" : "=a" (msr_efer_value)
 			       : "c"  (msr_efer_addr)
 			       : "%rdx");
 
 	msr_efer_value |= (1 << MSR_EFER_SVM_EN_BIT);
 
-	asm volatile("wrmsr\n" :
+	asm volatile("wrmsr\n\t" :
 			       : "c" (msr_efer_addr), "a" (msr_efer_value)
 			       : "memory");
 
@@ -484,7 +484,7 @@ static int svm_setup(void)
 	gdt = this_cpu_ptr(&gdt_page)->gdt;
 	cd->tss_desc = (struct ldttss_desc *)(gdt + GDT_ENTRY_TSS);
 
-	asm volatile("wrmsr\n" :
+	asm volatile("wrmsr\n\t" :
 			       : "c" (MSR_VM_HSAVE_PA), "a" (page_to_pfn(cd->save_area) << PAGE_SHIFT)
 			       : "memory");
 
@@ -502,20 +502,20 @@ static void svm_unsetup(void)
 	int msr_efer_value = 0;
 	int cpu;
 
-	asm volatile("wrmsr\n" :
+	asm volatile("wrmsr\n\t" :
 			       : "c" (MSR_VM_HSAVE_PA), "a" (0)
 			       : "memory");
 
 	for_each_possible_cpu(cpu)
 		local_cpu_uninit(cpu);
 
-	asm volatile("rdmsr\n" : "=a" (msr_efer_value)
+	asm volatile("rdmsr\n\t" : "=a" (msr_efer_value)
 			       : "c"  (msr_efer_addr)
 			       : "%rdx");
 
 	msr_efer_value &= ~(1 << MSR_EFER_SVM_EN_BIT);
 
-	asm volatile("wrmsr\n" :
+	asm volatile("wrmsr\n\t" :
 			       : "c" (msr_efer_addr), "a" (msr_efer_value)
 			       : "memory");
 
@@ -548,7 +548,7 @@ static int has_svm (void)
 				 : "%rbx","%rdx");
 
 	if (!((cpuid_value >> CPUID_EXT_1_SVM_BIT) & 1)) {
-		printk("CPUID: SVM not supported");
+		printk("has_svm: cpuid reports SVM not supported\n");
 		return 0;
 	}
 
@@ -558,7 +558,7 @@ static int has_svm (void)
 
 	msr_vm_cr_addr  = MSR_VM_CR_SVM_DIS_ADDR;
 
-	asm volatile("rdmsr\n" : "=a" (msr_vm_cr_value)
+	asm volatile("rdmsr\n\t" : "=a" (msr_vm_cr_value)
 			       : "c"  (msr_vm_cr_addr)
 			       : "%rdx");
 
@@ -576,9 +576,9 @@ static int has_svm (void)
 			         : "%rbx","%rcx");
 
 	if (!((cpuid_value >> CPUID_EXT_A_SVM_LOCK_BIT) & 1))
-		printk("CPUID: SVM disabled at BIOS (not unlockable)");
+		printk("has_svm: cpuid reports SVM disabled at BIOS (not unlockable)\n");
 	else
-		printk("CPUID: SVM disabled at BIOS (with key)");
+		printk("has:svm: cpuid reports SVM disabled at BIOS (with key)\n");
 
 	return 0;
 }
@@ -587,12 +587,12 @@ static int vmrun_init(void)
 {
 	int r;
 
-	printk("Initializing AMD-V (SVM) vmrun driver\n");
+	printk("vmrun_init: Initializing AMD-V (SVM) vmrun driver\n");
 
 	if (has_svm()) {
-		printk("SVM is supported and enabled on CPU\n");
+		printk("vmrun_init: SVM is supported and enabled on CPU\n");
 	} else {
-		printk("SVM not supported or enabled on CPU, nothing to be done\n");
+		printk("vmrun_init: SVM not supported or enabled on CPU, nothing to be done\n");
 		goto finish_here;
 	}
 
@@ -613,15 +613,14 @@ static int vmrun_init(void)
 
 	svm_unsetup();
 
-	asm volatile("sti\n");
-	printk("Enabled Interrupts\n");
+	asm volatile("sti\n\t");
 
 finish_here:
-	printk("Done\n");
+	printk("Done\n\t");
 	return 0;
 
 err:
-	printk("Error\n");
+	printk("Error\n\t");
 	return r;
 }
 

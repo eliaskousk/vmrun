@@ -420,6 +420,8 @@ static int local_cpu_init(int cpu)
 	if (!cd->save_area)
 		goto err;
 
+	per_cpu(local_cpu_data, cpu) = cd;
+
 	printk("local_cpu_init: [%d] Initialized cpu\n", cpu);
 
 	return 0;
@@ -443,27 +445,45 @@ static void local_cpu_uninit(int cpu)
 	printk("local_cpu_init: [%d] Unitialized cpu\n", cpu);
 }
 
+static int current_cpu_setup(void)
+{
+	struct svm_cpu_data *cd = per_cpu(local_cpu_data, raw_smp_processor_id());
+	struct desc_struct *gdt;
+	int r;
+
+	if (!cd) {
+		pr_err("%s: cpu_data is NULL on %d\n", __func__, raw_smp_processor_id());
+		r = -EINVAL;
+		return r;
+	}
+
+	cd->asid_generation = 1;
+	asm volatile("cpuid\n\t" : "=b" (cd->max_asid)
+				 : "a" (CPUID_EXT_A_SVM_LOCK_LEAF)
+				 : "%rcx","%rdx");
+	cd->max_asid--;
+	cd->next_asid = cd->max_asid + 1;
+
+	printk("current_cpu_setup: Initialized ASID");
+
+	gdt = this_cpu_ptr(&gdt_page)->gdt;
+	cd->tss_desc = (struct ldttss_desc *)(gdt + GDT_ENTRY_TSS);
+
+	printk("svm_setup: Registered TSS descriptor");
+
+	asm volatile("wrmsr\n\t" :
+				 : "c" (MSR_VM_HSAVE_PA), "A" (page_to_pfn(cd->save_area) << PAGE_SHIFT)
+				 :);
+
+	printk("current_cpu_setup: Registered host save area");
+
+	return 0;
+}
+
 static int svm_setup(void)
 {
 	int msr_efer_addr  = MSR_EFER_SVM_EN_ADDR;
 	int msr_efer_value = 0;
-	struct svm_cpu_data *cd;
-	struct desc_struct *gdt;
-	struct page *iopm_pages;
-	void *iopm_va;
-	int cpu;
-	int r;
-
-	iopm_pages = alloc_pages(GFP_KERNEL, IOPM_ALLOC_ORDER);
-
-	if (!iopm_pages)
-		return -ENOMEM;
-
-	iopm_va = page_address(iopm_pages);
-	memset(iopm_va, 0xff, PAGE_SIZE * (1 << IOPM_ALLOC_ORDER));
-	iopm_base = page_to_pfn(iopm_pages) << PAGE_SHIFT;
-
-	printk("svm_setup: Allocated I/O permission map");
 
 	asm volatile("rdmsr\n\t" : "=A" (msr_efer_value)
 			         : "c"  (msr_efer_addr)
@@ -477,65 +497,19 @@ static int svm_setup(void)
 
 	printk("svm_setup: Turned on MSR EFER.svme\n");
 
-	for_each_possible_cpu(cpu) {
-		r = local_cpu_init(cpu);
-		if (r)
-			goto err;
-	}
-
-	printk("svm_setup: Allocated local CPU data");
-
-	cd = per_cpu(local_cpu_data, cpu);
-	if (!cd) {
-		pr_err("%s: cpu_data is NULL on %d\n", __func__, cpu);
-		r = -EINVAL;
-		goto err;
-	}
-
-	cd->asid_generation = 1;
-	asm volatile("cpuid\n\t" : "=b" (cd->max_asid)
-				 : "a" (CPUID_EXT_A_SVM_LOCK_LEAF)
-				 : "%rcx","%rdx");
-	cd->max_asid--;
-	cd->next_asid = cd->max_asid + 1;
-
-	printk("svm_setup: Initialized ASID");
-
-	gdt = this_cpu_ptr(&gdt_page)->gdt;
-	cd->tss_desc = (struct ldttss_desc *)(gdt + GDT_ENTRY_TSS);
-
-	printk("svm_setup: Registered TSS descriptor");
-
-	asm volatile("wrmsr\n\t" :
-			         : "c" (MSR_VM_HSAVE_PA), "A" (page_to_pfn(cd->save_area) << PAGE_SHIFT)
-			         :);
-
-	printk("svm_setup: Registered host save area");
-
 	return 0;
-
-err:
-	__free_pages(iopm_pages, IOPM_ALLOC_ORDER);
-	iopm_base = 0;
-	return r;
 }
 
 static void svm_unsetup(void)
 {
 	int msr_efer_addr  = MSR_EFER_SVM_EN_ADDR;
 	int msr_efer_value = 0;
-	int cpu;
 
 	asm volatile("wrmsr\n\t" :
 			         : "c" (MSR_VM_HSAVE_PA), "A" (0)
 			         :);
 
 	printk("svm_unsetup: Unregistered host save area");
-
-	for_each_possible_cpu(cpu)
-		local_cpu_uninit(cpu);
-
-	printk("svm_unsetup: Freed local CPU data");
 
 	asm volatile("rdmsr\n\t" : "=A" (msr_efer_value)
 			       : "c"  (msr_efer_addr)
@@ -548,11 +522,6 @@ static void svm_unsetup(void)
 			         :);
 
 	printk("svm_unsetup: Turned off MSR EFER.svme\n");
-
-	__free_pages(pfn_to_page(iopm_base >> PAGE_SHIFT), IOPM_ALLOC_ORDER);
-	iopm_base = 0;
-
-	printk("svm_unsetup: Freed I/O permission map");
 }
 
 static int has_svm (void)
@@ -613,8 +582,36 @@ static int has_svm (void)
 	return 0;
 }
 
+static int iopm_allocate(void)
+{
+	struct page *iopm_pages;
+	void *iopm_va;
+
+	iopm_pages = alloc_pages(GFP_KERNEL, IOPM_ALLOC_ORDER);
+
+	if (!iopm_pages)
+		return -ENOMEM;
+
+	iopm_va = page_address(iopm_pages);
+	memset(iopm_va, 0xff, PAGE_SIZE * (1 << IOPM_ALLOC_ORDER));
+	iopm_base = page_to_pfn(iopm_pages) << PAGE_SHIFT;
+
+	printk("iopm_allocate: Allocated I/O permission map");
+
+	return 0;
+}
+
+static void iopm_free(void)
+{
+	__free_pages(pfn_to_page(iopm_base >> PAGE_SHIFT), IOPM_ALLOC_ORDER);
+	iopm_base = 0;
+
+	printk("iopm_free: Freed I/O permission map");
+}
+
 static int vmrun_init(void)
 {
+	int cpu;
 	int r;
 
 	printk("vmrun_init: Initializing AMD-V (SVM) vmrun driver\n");
@@ -626,7 +623,21 @@ static int vmrun_init(void)
 		goto finish_here;
 	}
 
+	r = iopm_allocate();
+	if (r)
+		goto err;
+
 	r = svm_setup();
+	if (r)
+		goto err;
+
+	for_each_possible_cpu(cpu) {
+		r = local_cpu_init(cpu);
+		if (r)
+			goto err;
+	}
+
+	r = current_cpu_setup();
 	if (r)
 		goto err;
 
@@ -642,14 +653,20 @@ static int vmrun_init(void)
 		printk("vmrun_init: Freed vcpu %d\n", i);
 	}
 
+	for_each_possible_cpu(cpu)
+		local_cpu_uninit(cpu);
+
+	printk("svm_unsetup: Freed local CPU data");
+
 	svm_unsetup();
+
+	iopm_free();
 
 	asm volatile("sti\n\t");
 
 finish_here:
 	printk("vmrun_init: Done\n");
 	return 0;
-
 err:
 	printk("vmrun_init: Error\n");
 	return r;

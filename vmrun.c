@@ -85,6 +85,8 @@ static void vmcb_init(struct svm_vcpu *vcpu)
 	unsigned long cr0 = X86_CR0_NW | X86_CR0_CD | X86_CR0_ET;
 
 	control->intercept |= (1ULL << INTERCEPT_INTR);
+	control->intercept |= (1ULL << INTERCEPT_NMI);
+	control->intercept |= (1ULL << INTERCEPT_SMI);
 	control->intercept |= (1ULL << INTERCEPT_VMRUN);   // Needed?
 	control->intercept |= (1ULL << INTERCEPT_VMMCALL);
 	control->clean     &= ~(1 << VMCB_INTERCEPTS);

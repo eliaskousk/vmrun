@@ -300,7 +300,7 @@ static void vcpu_run(struct svm_vcpu *vcpu)
 	vcpu->regs[VCPU_REGS_RIP] = vcpu->vmcb->save.rip;
 
 	asm volatile(
-        INSTR_SVM_CLGI "\n\t"
+        	INSTR_SVM_CLGI "\n\t"
 		"push %%" _ASM_BP " \n\t"
 		"mov %c[rbx](%[vcpu]), %%" _ASM_BX " \n\t"
 		"mov %c[rcx](%[vcpu]), %%" _ASM_CX " \n\t"
@@ -320,9 +320,9 @@ static void vcpu_run(struct svm_vcpu *vcpu)
 		/* Enter guest mode */
 		"push %%" _ASM_AX " \n\t"
 		"mov %c[vmcb](%[vcpu]), %%" _ASM_AX " \n\t"
-        INSTR_SVM_VMLOAD "\n\t"
-        INSTR_SVM_VMRUN "\n\t"
-        INSTR_SVM_VMSAVE "\n\t"
+		INSTR_SVM_VMLOAD "\n\t"
+		INSTR_SVM_VMRUN "\n\t"
+		INSTR_SVM_VMSAVE "\n\t"
 		"pop %%" _ASM_AX " \n\t"
 
 		/* Save guest registers, load host registers */
@@ -341,7 +341,7 @@ static void vcpu_run(struct svm_vcpu *vcpu)
 		"mov %%r14, %c[r14](%[vcpu]) \n\t"
 		"mov %%r15, %c[r15](%[vcpu]) \n\t"
 		"pop %%" _ASM_BP " \n\t"
-        INSTR_SVM_STGI "\n\t"
+        	INSTR_SVM_STGI "\n\t"
 
 		: // No outputs
 
@@ -370,8 +370,8 @@ static void vcpu_run(struct svm_vcpu *vcpu)
 	asm volatile("nop\n\t"); //will never get here
 
 	asm volatile("guest_entry_point:");
-	/*asm volatile(INSTR_SVM_VMMCALL);*/
-	/*asm volatile("ud2\n\t"); //will never get here*/
+	asm volatile(INSTR_SVM_VMMCALL);
+	asm volatile("ud2\n\t"); //will never get here
 
 	asm volatile("vmexit_handler:\n");
 	printk("vcpu_run: Guest #vmexit Info\n");

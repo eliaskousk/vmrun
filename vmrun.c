@@ -293,7 +293,7 @@ static void vcpu_setup(struct svm_vcpu *vcpu)
 
 static void vcpu_run(struct svm_vcpu *vcpu)
 {
-	printk("Doing vmrun now...\n\t");
+	printk("Doing vmrun now...\n");
 
 	asm volatile("movq $guest_entry_point, %rax\n\t");
 	asm volatile("movq %%rax, %0\n\t" : "=r" (vcpu->vmcb->save.rip));
@@ -634,10 +634,10 @@ static int vmrun_init(void)
 
 		struct svm_vcpu *vcpu = vcpu_create(i);
 		printk("vmrun_init: Created vcpu %d\n", i);
-		/*vcpu_setup(vcpu);*/
-		/*printk("vmrun_init: Setup vcpu %d\n", i);*/
-		/*vcpu_run(vcpu);*/
-		/*printk("vmrun_init: Run vcpu %d\n", i);*/
+        vcpu_setup(vcpu);
+        printk("vmrun_init: Setup vcpu %d\n", i);
+        vcpu_run(vcpu);
+        printk("vmrun_init: Run vcpu %d\n", i);
 		vcpu_free(vcpu);
 		printk("vmrun_init: Freed vcpu %d\n", i);
 	}

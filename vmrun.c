@@ -117,7 +117,7 @@ static void vmcb_init(struct svm_vcpu *vcpu)
 	save->dr6 = 0xffff0ff0;
 
 	save->efer = EFER_SVME | EFER_LME | EFER_LMA;
-	save->cr0 = cr0 | X86_CR0_PG | X86_CR0_WP;
+	save->cr0 = cr0 | X86_CR0_PE | X86_CR0_PG | X86_CR0_WP;
 	save->cr4 = X86_CR4_PAE;
 	control->clean &= ~(1 << VMCB_CR);
 	control->clean = 0;

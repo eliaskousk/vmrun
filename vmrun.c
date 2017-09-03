@@ -196,7 +196,7 @@ static void vcpu_setup(struct svm_vcpu *vcpu)
 	struct system_table gdt, idt;
 	u64 tr_base, tr_base_lo, tr_base_hi, tr_base_real;
 	u32 fs_gs_base_low, fs_gs_base_hi;
-	u16 attr_cs, attr_ss, attr_tr;
+	u32 attr_cs, attr_ss, attr_tr;
 
 	asm volatile("movw %%cs, %%ax\n\t"  : "=a" (vcpu->vmcb->save.cs.selector));
 	asm volatile("lar %%eax, %%eax\n\t" : "=a" (attr_cs) : "a" (vcpu->vmcb->save.cs.selector));
@@ -219,9 +219,9 @@ static void vcpu_setup(struct svm_vcpu *vcpu)
 	vcpu->vmcb->save.gs.limit    = 0xffffffff;
 	vcpu->vmcb->save.ldtr.limit  = 0x0;
 
-	vcpu->vmcb->save.tr.attrib   = attr_tr >> 8;
-	vcpu->vmcb->save.cs.attrib   = attr_cs >> 8;
-	vcpu->vmcb->save.ss.attrib   = attr_ss >> 8;
+	vcpu->vmcb->save.tr.attrib   = attr_tr >> 16;
+	vcpu->vmcb->save.cs.attrib   = attr_cs >> 16;
+	vcpu->vmcb->save.ss.attrib   = attr_ss >> 16;
 	vcpu->vmcb->save.es.attrib   = 0x000;
 	vcpu->vmcb->save.ds.attrib   = 0x000;
 	vcpu->vmcb->save.fs.attrib   = 0x000;
@@ -634,10 +634,10 @@ static int vmrun_init(void)
 
 		struct svm_vcpu *vcpu = vcpu_create(i);
 		printk("vmrun_init: Created vcpu %d\n", i);
-        vcpu_setup(vcpu);
-        printk("vmrun_init: Setup vcpu %d\n", i);
-        vcpu_run(vcpu);
-        printk("vmrun_init: Run vcpu %d\n", i);
+		vcpu_setup(vcpu);
+		printk("vmrun_init: Setup vcpu %d\n", i);
+		vcpu_run(vcpu);
+		printk("vmrun_init: Run vcpu %d\n", i);
 		vcpu_free(vcpu);
 		printk("vmrun_init: Freed vcpu %d\n", i);
 	}

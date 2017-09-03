@@ -43,7 +43,7 @@
 #define MSRPM_ALLOC_ORDER         1
 
 #define SEG_TYPE_LDT              2
-#define SEG_TYPE_BUSY_TSS16       3
+#define SEG_TYPE_AVAIL_TSS64      9
 
 #define NR_VCPUS                  2
 

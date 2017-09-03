@@ -110,13 +110,13 @@ static void vmcb_init(struct svm_vcpu *vcpu)
 	save->idtr.limit = 0xffff;
 
 	init_sys_seg(&save->ldtr, SEG_TYPE_LDT);
-	init_sys_seg(&save->tr, SEG_TYPE_BUSY_TSS16);
+	init_sys_seg(&save->tr, SEG_TYPE_AVAIL_TSS64);
 
 	save->rip = 0x0000fff0;
 	save->rflags = 2;
 	save->dr6 = 0xffff0ff0;
 
-	save->efer = EFER_SVME;
+	save->efer = EFER_SVME | EFER_LME | EFER_LMA;
 	save->cr0 = cr0 | X86_CR0_PG | X86_CR0_WP;
 	save->cr4 = X86_CR4_PAE;
 	control->clean &= ~(1 << VMCB_CR);
@@ -293,15 +293,15 @@ static void vcpu_setup(struct svm_vcpu *vcpu)
 
 static void vcpu_run(struct svm_vcpu *vcpu)
 {
-	printk("Doing vmrun now...\n");
+	printk("vcpu_run: Doing vmrun now\n");
 
 	asm volatile("movq $guest_entry_point, %rax\n\t");
 	asm volatile("movq %%rax, %0\n\t" : "=r" (vcpu->vmcb->save.rip));
 	vcpu->regs[VCPU_REGS_RIP] = vcpu->vmcb->save.rip;
 
 	asm volatile(
-		INSTR_SVM_CLGI "\n\t"
-		"push %%" _ASM_BP "; \n\t"
+        INSTR_SVM_CLGI "\n\t"
+		"push %%" _ASM_BP " \n\t"
 		"mov %c[rbx](%[vcpu]), %%" _ASM_BX " \n\t"
 		"mov %c[rcx](%[vcpu]), %%" _ASM_CX " \n\t"
 		"mov %c[rdx](%[vcpu]), %%" _ASM_DX " \n\t"
@@ -320,9 +320,9 @@ static void vcpu_run(struct svm_vcpu *vcpu)
 		/* Enter guest mode */
 		"push %%" _ASM_AX " \n\t"
 		"mov %c[vmcb](%[vcpu]), %%" _ASM_AX " \n\t"
-		INSTR_SVM_VMLOAD "\n\t"
-		INSTR_SVM_VMRUN "\n\t"
-		INSTR_SVM_VMSAVE "\n\t"
+        INSTR_SVM_VMLOAD "\n\t"
+        INSTR_SVM_VMRUN "\n\t"
+        INSTR_SVM_VMSAVE "\n\t"
 		"pop %%" _ASM_AX " \n\t"
 
 		/* Save guest registers, load host registers */
@@ -340,7 +340,8 @@ static void vcpu_run(struct svm_vcpu *vcpu)
 		"mov %%r13, %c[r13](%[vcpu]) \n\t"
 		"mov %%r14, %c[r14](%[vcpu]) \n\t"
 		"mov %%r15, %c[r15](%[vcpu]) \n\t"
-		"pop %%" _ASM_BP
+		"pop %%" _ASM_BP " \n\t"
+        INSTR_SVM_STGI "\n\t"
 
 		: // No outputs
 
@@ -364,27 +365,27 @@ static void vcpu_run(struct svm_vcpu *vcpu)
 		: "cc", "memory", "rbx", "rcx", "rdx", "rsi", "rdi",
 		  "r8", "r9", "r10", "r11" , "r12", "r13", "r14", "r15");
 
-	printk("After #vmexit\n\t");
+	printk("vcpu_run: After #vmexit\n");
 	asm volatile("jmp vmexit_handler\n\t");
 	asm volatile("nop\n\t"); //will never get here
 
 	asm volatile("guest_entry_point:");
-	asm volatile(INSTR_SVM_VMMCALL);
-	asm volatile("ud2\n\t"); //will never get here
+	/*asm volatile(INSTR_SVM_VMMCALL);*/
+	/*asm volatile("ud2\n\t"); //will never get here*/
 
 	asm volatile("vmexit_handler:\n");
-	printk("Guest #vmexit Info\n");
-	printk("Code: 0x%x\n\t", vcpu->vmcb->control.exit_code);
-	printk("Info 1: 0x%llx\n\t", vcpu->vmcb->control.exit_info_1);
-	printk("Info 2: 0x%llx\n\t", vcpu->vmcb->control.exit_info_2);
+	printk("vcpu_run: Guest #vmexit Info\n");
+	printk("vcpu_run: Code: 0x%x\n", vcpu->vmcb->control.exit_code);
+	printk("vcpu_run: Info 1: 0x%llx\n", vcpu->vmcb->control.exit_info_1);
+	printk("vcpu_run: Info 2: 0x%llx\n", vcpu->vmcb->control.exit_info_2);
 
 	if (vcpu->vmcb->control.exit_code == SVM_EXIT_ERR) {
-		pr_err("VMRUN Failed\n");
+		pr_err("vcpu_run: vmrun failed\n");
 		return;
 	}
 
 	if (vcpu->vmcb->control.exit_code == SVM_EXIT_VMMCALL) {
-		printk("VMRUN and VMMCALL Succeeded\n");
+		printk("vcpu_run: vmrun and vmmcall succeeded\n");
 		vcpu->next_rip = vcpu->regs[VCPU_REGS_RIP] + 3;
 	}
 }

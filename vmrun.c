@@ -186,10 +186,16 @@ out:
 	return ERR_PTR(err);
 }
 
+struct __attribute__ ((__packed__)) system_table {
+	u16 limit;
+	u64 base;
+};
+
 static void vcpu_setup(struct svm_vcpu *vcpu)
 {
-	u64 gdt_base, idt_base, tr_base, tr_base_lo, tr_base_hi, tr_base_real;
-	u32 gdt_limit, idt_limit, fs_gs_base_low, fs_gs_base_hi;
+	struct system_table gdt, idt;
+	u64 tr_base, tr_base_lo, tr_base_hi, tr_base_real;
+	u32 fs_gs_base_low, fs_gs_base_hi;
 	u16 attr_cs, attr_ss, attr_tr;
 
 	asm volatile("movw %%cs, %%ax\n\t"  : "=a" (vcpu->vmcb->save.cs.selector));
@@ -222,32 +228,15 @@ static void vcpu_setup(struct svm_vcpu *vcpu)
 	vcpu->vmcb->save.gs.attrib   = 0x000;
 	vcpu->vmcb->save.ldtr.attrib = 0x000;
 
-	asm volatile("sgdt %0\n\t" : : "m" (gdt_base));
-	gdt_limit = (u32)gdt_base & 0xffff;
-	gdt_base  = gdt_base >> 16; //base
+	asm volatile("sgdt %0\n\t" : : "m" (gdt));
+	vcpu->vmcb->save.gdtr.base  = gdt.base;
+	vcpu->vmcb->save.gdtr.limit = gdt.limit;
 
-	if((gdt_base >> 47 & 0x1)) {
-		gdt_base |= 0xffff000000000000ull;
-	}
+	asm volatile("sidt %0\n\t" : : "m" (idt));
+	vcpu->vmcb->save.idtr.base  = idt.base;
+	vcpu->vmcb->save.idtr.limit = idt.limit;
 
-	vcpu->vmcb->save.gdtr.base  = gdt_base;
-	vcpu->vmcb->save.gdtr.limit = gdt_limit;
-
-	asm volatile("sidt %0\n\t" : : "m" (idt_base));
-	idt_limit = (u32)idt_base & 0xffff;
-	idt_base  = idt_base >> 16; //base
-
-	if((idt_base >> 47 & 0x1)) {
-		idt_base |= 0xffff000000000000ull;
-	}
-
-	vcpu->vmcb->save.idtr.base  = idt_base;
-	vcpu->vmcb->save.idtr.limit = idt_limit;
-
-	tr_base = gdt_base + vcpu->vmcb->save.tr.selector;
-	if((tr_base >> 47 & 0x1)) {
-		tr_base |= 0xffff000000000000ull;
-	}
+	tr_base = gdt.base + vcpu->vmcb->save.tr.selector;
 
 	// SS segment override
 	asm volatile("mov %0,%%rax\n\t"

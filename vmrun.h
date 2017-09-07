@@ -45,7 +45,7 @@
 #define SEG_TYPE_LDT              2
 #define SEG_TYPE_AVAIL_TSS64      9
 
-#define NR_VCPUS                  2
+#define NR_VCPUS                  1
 
 #define INSTR_SVM_VMRUN           ".byte 0x0f, 0x01, 0xd8"
 #define INSTR_SVM_VMMCALL         ".byte 0x0f, 0x01, 0xd9"

@@ -56,10 +56,131 @@
 MODULE_LICENSE("Dual BSD/GPL");
 
 static DEFINE_PER_CPU(struct svm_vcpu *, local_vcpu);
-static DEFINE_PER_CPU(struct svm_cpu_data *, local_cpu_data);
+static DEFINE_PER_CPU(struct svm_cpu_data *, cpu_data);
 static DEFINE_PER_CPU(struct vmcb *, local_vmcb);
 
 static unsigned long iopm_base;
+
+static void svm_enable(void)
+{
+	int msr_efer_addr  = MSR_EFER_SVM_EN_ADDR;
+	int msr_efer_value = 0;
+
+	asm volatile("rdmsr\n\t" : "=A" (msr_efer_value)
+	: "c"  (msr_efer_addr)
+	:);
+
+	msr_efer_value |= (1 << MSR_EFER_SVM_EN_BIT);
+
+	asm volatile("wrmsr\n\t" :
+	: "c" (msr_efer_addr), "A" (msr_efer_value)
+	:);
+
+	printk("svm_setup: Turned on MSR EFER.svme\n");
+}
+
+static void svm_disable(void)
+{
+	int msr_efer_addr  = MSR_EFER_SVM_EN_ADDR;
+	int msr_efer_value = 0;
+
+	asm volatile("rdmsr\n\t" : "=A" (msr_efer_value)
+	: "c"  (msr_efer_addr)
+	:);
+
+	msr_efer_value &= ~(1 << MSR_EFER_SVM_EN_BIT);
+
+	asm volatile("wrmsr\n\t" :
+	: "c" (msr_efer_addr), "A" (msr_efer_value)
+	:);
+
+	printk("svm_unsetup: Turned off MSR EFER.svme\n");
+}
+
+static int has_svm (void)
+{
+	int cpuid_leaf      = 0;
+	int cpuid_value     = 0;
+	int msr_vm_cr_addr  = 0;
+	int msr_vm_cr_value = 0;
+
+	//
+	// See AMD64 APM
+	// Vol.2, Chapter 15, Section 4 (Enabling SVM)
+	//
+
+	//
+	// CPUID check (if SVM is supported)
+	//
+
+	cpuid_leaf  = CPUID_EXT_1_SVM_LEAF;
+
+	asm volatile("cpuid\n\t" : "=c" (cpuid_value)
+	: "a"  (cpuid_leaf)
+	: "%rbx","%rdx");
+
+	if (!((cpuid_value >> CPUID_EXT_1_SVM_BIT) & 1)) {
+		printk("has_svm: cpuid reports SVM not supported\n");
+		return 0;
+	}
+
+	//
+	// MSR VM CR check (if SVM is disabled)
+	//
+
+	msr_vm_cr_addr  = MSR_VM_CR_SVM_DIS_ADDR;
+
+	asm volatile("rdmsr\n\t" : "=a" (msr_vm_cr_value)
+	: "c"  (msr_vm_cr_addr)
+	: "%rdx");
+
+	if (!(msr_vm_cr_value & (1 << MSR_VM_CR_SVM_DIS_BIT)))
+		return 1;
+
+	//
+	// CPUID check (if SVM is locked)
+	//
+
+	cpuid_leaf  = CPUID_EXT_A_SVM_LOCK_LEAF;
+
+	asm volatile("cpuid\n\t" : "=d" (cpuid_value)
+	: "a"  (cpuid_leaf)
+	: "%rbx","%rcx");
+
+	if (!((cpuid_value >> CPUID_EXT_A_SVM_LOCK_BIT) & 1))
+		printk("has_svm: cpuid reports SVM disabled at BIOS (not unlockable)\n");
+	else
+		printk("has:svm: cpuid reports SVM disabled at BIOS (with key)\n");
+
+	return 0;
+}
+
+static int iopm_allocate(void)
+{
+	struct page *iopm_pages;
+	void *iopm_va;
+
+	iopm_pages = alloc_pages(GFP_KERNEL, IOPM_ALLOC_ORDER);
+
+	if (!iopm_pages)
+		return -ENOMEM;
+
+	iopm_va = page_address(iopm_pages);
+	memset(iopm_va, 0xff, PAGE_SIZE * (1 << IOPM_ALLOC_ORDER));
+	iopm_base = page_to_pfn(iopm_pages) << PAGE_SHIFT;
+
+	printk("iopm_allocate: Allocated I/O permission map");
+
+	return 0;
+}
+
+static void iopm_free(void)
+{
+	__free_pages(pfn_to_page(iopm_base >> PAGE_SHIFT), IOPM_ALLOC_ORDER);
+	iopm_base = 0;
+
+	printk("iopm_free: Freed I/O permission map");
+}
 
 static void init_seg(struct vmcb_seg *seg)
 {
@@ -174,7 +295,7 @@ static struct svm_vcpu *vcpu_create(unsigned int id)
 
 	printk("vcpu_create: [%d] Initialized vmcb\n", id);
 
-	vcpu->cpu_data = per_cpu(local_cpu_data, me);
+	vcpu->cpu_data = per_cpu(cpu_data, me);
 	per_cpu(local_vcpu, me) = vcpu;
 	per_cpu(local_vmcb, me) = vcpu->vmcb;
 
@@ -188,10 +309,10 @@ out:
 	return ERR_PTR(err);
 }
 
-struct __attribute__ ((__packed__)) system_table {
+struct system_table {
 	u16 limit;
 	u64 base;
-};
+} __attribute__ ((__packed__));
 
 static void vcpu_setup(struct svm_vcpu *vcpu)
 {
@@ -398,7 +519,7 @@ static void vcpu_free(struct svm_vcpu *vcpu)
 	kfree(vcpu);
 }
 
-static int local_cpu_init(int cpu)
+static int cpu_setup(int cpu)
 {
 	struct svm_cpu_data *cd;
 	int r;
@@ -412,9 +533,9 @@ static int local_cpu_init(int cpu)
 	if (!cd->save_area)
 		goto err;
 
-	per_cpu(local_cpu_data, cpu) = cd;
+	per_cpu(cpu_data, cpu) = cd;
 
-	printk("local_cpu_init: [%d] Initialized cpu\n", cpu);
+	printk("cpu_setup: Setup CPU %d\n", cpu);
 
 	return 0;
 
@@ -423,30 +544,35 @@ err:
 	return r;
 }
 
-static void local_cpu_uninit(int cpu)
+static void cpu_unsetup(int cpu)
 {
-	struct svm_cpu_data *cd = per_cpu(local_cpu_data, cpu);
+	struct svm_cpu_data *cd = per_cpu(cpu_data, cpu);
 
 	if (!cd)
 		return;
 
-	per_cpu(local_cpu_data, cpu) = NULL;
+	per_cpu(cpu_data, cpu) = NULL;
 	__free_page(cd->save_area);
 	kfree(cd);
 
-	printk("local_cpu_init: [%d] Unitialized cpu\n", cpu);
+	printk("cpu_unsetup: Unsetup CPU %d\n", cpu);
 }
 
-static int current_cpu_setup(void)
+static void cpu_enable(void *unused)
 {
-	struct svm_cpu_data *cd = per_cpu(local_cpu_data, raw_smp_processor_id());
+	struct svm_cpu_data *cd;
 	struct desc_struct *gdt;
-	int r;
+	int me = raw_smp_processor_id();
+
+	if (!has_svm()) {
+		printk("cpu_enable: SVM is not supported and enabled on CPU %d\n", me);
+	}
+
+	cd = per_cpu(cpu_data, me);
 
 	if (!cd) {
-		pr_err("%s: cpu_data is NULL on %d\n", __func__, raw_smp_processor_id());
-		r = -EINVAL;
-		return r;
+		pr_err("%s: cpu_data is NULL on CPU %d\n", __func__, me);
+		return;
 	}
 
 	cd->asid_generation = 1;
@@ -456,149 +582,46 @@ static int current_cpu_setup(void)
 	cd->max_asid--;
 	cd->next_asid = cd->max_asid + 1;
 
-	printk("current_cpu_setup: Initialized ASID");
+	printk("cpu_enable: Initialized ASID on CPU %d\n", me);
+
+	// struct desc_ptr gdt_descr;
+	// asm volatile("sgdt %0" : "=m" (gdt_descr));
+	// gdt = (struct desc_struct *)gdt_descr.address;
 
 	gdt = this_cpu_ptr(&gdt_page)->gdt;
 	cd->tss_desc = (struct ldttss_desc *)(gdt + GDT_ENTRY_TSS);
 
-	printk("current_cpu_setup: Registered TSS descriptor");
+	printk("cpu_enable: Registered TSS descriptor on CPU %d\n", me);
+
+	svm_enable();
+
+	printk("cpu_enable: Enabled SVM on CPU %d\n", me);
 
 	asm volatile("wrmsr\n\t" :
 				 : "c" (MSR_VM_HSAVE_PA), "A" (page_to_pfn(cd->save_area) << PAGE_SHIFT)
 				 :);
 
-	printk("current_cpu_setup: Registered host save area");
-
-	return 0;
+	printk("cpu_setup: Registered host save area on CPU %d\n", me);
 }
 
-static int svm_setup(void)
+static void cpu_disable(void *unused)
 {
-	int msr_efer_addr  = MSR_EFER_SVM_EN_ADDR;
-	int msr_efer_value = 0;
+	struct svm_cpu_data *cd;
+	int me = raw_smp_processor_id();
 
-	asm volatile("rdmsr\n\t" : "=A" (msr_efer_value)
-			         : "c"  (msr_efer_addr)
-			         :);
+	cd = per_cpu(cpu_data, me);
 
-	msr_efer_value |= (1 << MSR_EFER_SVM_EN_BIT);
+	if (cd) {
+		asm volatile("wrmsr\n\t" :
+					 : "c" (MSR_VM_HSAVE_PA), "A" (0)
+					 :);
 
-	asm volatile("wrmsr\n\t" :
-			         : "c" (msr_efer_addr), "A" (msr_efer_value)
-			         :);
+		printk("cpu_disable: Unregistered host save area on CPU %d\n", me);
 
-	printk("svm_setup: Turned on MSR EFER.svme\n");
+		svm_disable();
 
-	return 0;
-}
-
-static void svm_unsetup(void)
-{
-	int msr_efer_addr  = MSR_EFER_SVM_EN_ADDR;
-	int msr_efer_value = 0;
-
-	asm volatile("wrmsr\n\t" :
-			         : "c" (MSR_VM_HSAVE_PA), "A" (0)
-			         :);
-
-	printk("svm_unsetup: Unregistered host save area");
-
-	asm volatile("rdmsr\n\t" : "=A" (msr_efer_value)
-			       : "c"  (msr_efer_addr)
-			       :);
-
-	msr_efer_value &= ~(1 << MSR_EFER_SVM_EN_BIT);
-
-	asm volatile("wrmsr\n\t" :
-			         : "c" (msr_efer_addr), "A" (msr_efer_value)
-			         :);
-
-	printk("svm_unsetup: Turned off MSR EFER.svme\n");
-}
-
-static int has_svm (void)
-{
-	int cpuid_leaf      = 0;
-	int cpuid_value     = 0;
-	int msr_vm_cr_addr  = 0;
-	int msr_vm_cr_value = 0;
-
-	//
-	// See AMD64 APM
-	// Vol.2, Chapter 15, Section 4 (Enabling SVM)
-	//
-
-	//
-	// CPUID check (if SVM is supported)
-	//
-
-	cpuid_leaf  = CPUID_EXT_1_SVM_LEAF;
-
-	asm volatile("cpuid\n\t" : "=c" (cpuid_value)
-				 : "a"  (cpuid_leaf)
-				 : "%rbx","%rdx");
-
-	if (!((cpuid_value >> CPUID_EXT_1_SVM_BIT) & 1)) {
-		printk("has_svm: cpuid reports SVM not supported\n");
-		return 0;
+		printk("cpu_disable: Disabled SVM on CPU %d\n", me);
 	}
-
-	//
-	// MSR VM CR check (if SVM is disabled)
-	//
-
-	msr_vm_cr_addr  = MSR_VM_CR_SVM_DIS_ADDR;
-
-	asm volatile("rdmsr\n\t" : "=a" (msr_vm_cr_value)
-			         : "c"  (msr_vm_cr_addr)
-			         : "%rdx");
-
-	if (!(msr_vm_cr_value & (1 << MSR_VM_CR_SVM_DIS_BIT)))
-		return 1;
-
-	//
-	// CPUID check (if SVM is locked)
-	//
-
-	cpuid_leaf  = CPUID_EXT_A_SVM_LOCK_LEAF;
-
-	asm volatile("cpuid\n\t" : "=d" (cpuid_value)
-			         : "a"  (cpuid_leaf)
-			         : "%rbx","%rcx");
-
-	if (!((cpuid_value >> CPUID_EXT_A_SVM_LOCK_BIT) & 1))
-		printk("has_svm: cpuid reports SVM disabled at BIOS (not unlockable)\n");
-	else
-		printk("has:svm: cpuid reports SVM disabled at BIOS (with key)\n");
-
-	return 0;
-}
-
-static int iopm_allocate(void)
-{
-	struct page *iopm_pages;
-	void *iopm_va;
-
-	iopm_pages = alloc_pages(GFP_KERNEL, IOPM_ALLOC_ORDER);
-
-	if (!iopm_pages)
-		return -ENOMEM;
-
-	iopm_va = page_address(iopm_pages);
-	memset(iopm_va, 0xff, PAGE_SIZE * (1 << IOPM_ALLOC_ORDER));
-	iopm_base = page_to_pfn(iopm_pages) << PAGE_SHIFT;
-
-	printk("iopm_allocate: Allocated I/O permission map");
-
-	return 0;
-}
-
-static void iopm_free(void)
-{
-	__free_pages(pfn_to_page(iopm_base >> PAGE_SHIFT), IOPM_ALLOC_ORDER);
-	iopm_base = 0;
-
-	printk("iopm_free: Freed I/O permission map");
 }
 
 static int vmrun_init(void)
@@ -619,19 +642,13 @@ static int vmrun_init(void)
 	if (r)
 		goto err;
 
-	r = svm_setup();
-	if (r)
-		goto err;
-
-	for_each_possible_cpu(cpu) {
-		r = local_cpu_init(cpu);
+	for_each_online_cpu(cpu) {
+		r = cpu_setup(cpu);
 		if (r)
 			goto err;
 	}
 
-	r = current_cpu_setup();
-	if (r)
-		goto err;
+	on_each_cpu(cpu_enable, 0, 1);
 
 	for (unsigned int i = 0; i < NR_VCPUS; i++) {
 
@@ -645,12 +662,10 @@ static int vmrun_init(void)
 		printk("vmrun_init: Freed vcpu %d\n", i);
 	}
 
-	for_each_possible_cpu(cpu)
-		local_cpu_uninit(cpu);
+	on_each_cpu(cpu_disable, 0, 1);
 
-	printk("svm_unsetup: Freed local CPU data");
-
-	svm_unsetup();
+	for_each_online_cpu(cpu)
+		cpu_unsetup(cpu);
 
 	iopm_free();
 

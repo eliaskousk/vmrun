@@ -588,6 +588,8 @@ static void cpu_enable(void *unused)
 
 	printk("cpu_enable: Initialized ASID on CPU %d\n", me);
 
+	// Alternative to the code below for TSS desc registration
+	//
 	// struct desc_ptr gdt_descr;
 	// asm volatile("sgdt %0" : "=m" (gdt_descr));
 	// gdt = (struct desc_struct *)gdt_descr.address;
@@ -616,11 +618,13 @@ static void cpu_disable(void *unused)
 	cd = per_cpu(cpu_data, me);
 
 	if (cd) {
-		asm volatile("wrmsr\n\t" :
-					 : "c" (MSR_VM_HSAVE_PA), "A" (0)
-					 :);
+		// This hangs the machine, no reason why but it does!
+		//
+		// asm volatile("wrmsr\n\t" :
+		// 			    : "c" (MSR_VM_HSAVE_PA), "A" (0)
+		// 			    :);
 
-		printk("cpu_disable: Unregistered host save area on CPU %d\n", me);
+		//printk("cpu_disable: Unregistered host save area on CPU %d\n", me);
 
 		svm_disable();
 

@@ -418,6 +418,8 @@ static void vcpu_run(struct svm_vcpu *vcpu)
 {
 	printk("vcpu_run: Doing vmrun now\n");
 
+	get_cpu();
+
 	asm volatile("movq $guest_entry_point, %rax\n\t");
 	asm volatile("movq %%rax, %0\n\t" : "=r" (vcpu->vmcb->save.rip));
 	vcpu->regs[VCPU_REGS_RIP] = vcpu->vmcb->save.rip;
@@ -511,6 +513,8 @@ static void vcpu_run(struct svm_vcpu *vcpu)
 		printk("vcpu_run: vmrun and vmmcall succeeded\n");
 		vcpu->next_rip = vcpu->regs[VCPU_REGS_RIP] + 3;
 	}
+
+	put_cpu();
 }
 
 static void vcpu_free(struct svm_vcpu *vcpu)

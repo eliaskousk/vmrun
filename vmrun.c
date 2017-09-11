@@ -75,8 +75,6 @@ static void svm_enable(void)
 	asm volatile("wrmsr\n\t" :
 	: "c" (msr_efer_addr), "A" (msr_efer_value)
 	:);
-
-	printk("svm_setup: Turned on MSR EFER.svme\n");
 }
 
 static void svm_disable(void)
@@ -93,8 +91,6 @@ static void svm_disable(void)
 	asm volatile("wrmsr\n\t" :
 	: "c" (msr_efer_addr), "A" (msr_efer_value)
 	:);
-
-	printk("svm_unsetup: Turned off MSR EFER.svme\n");
 }
 
 static int has_svm (void)

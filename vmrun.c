@@ -412,6 +412,9 @@ static void vcpu_setup(struct svm_vcpu *vcpu)
 
 static void vcpu_run(struct svm_vcpu *vcpu)
 {
+	int cpu = 0;
+	struct svm_cpu_data *cd = NULL;
+
 	printk("vcpu_run: Doing vmrun now\n");
 
 	get_cpu();
@@ -419,6 +422,23 @@ static void vcpu_run(struct svm_vcpu *vcpu)
 	asm volatile("movq $guest_entry_point, %rax\n\t");
 	asm volatile("movq %%rax, %0\n\t" : "=r" (vcpu->vmcb->save.rip));
 	vcpu->regs[VCPU_REGS_RIP] = vcpu->vmcb->save.rip;
+
+	cpu = raw_smp_processor_id();
+	cd  = per_cpu(cpu_data, cpu);
+
+	vcpu->vmcb->control.tlb_ctl = TLB_CONTROL_DO_NOTHING;
+	if (vcpu->cpu != cpu ||
+	    vcpu->asid_generation != cd->asid_generation) {
+		if (cd->next_asid > cd->max_asid) {
+			++cd->asid_generation;
+			cd->next_asid = 1;
+			vcpu->vmcb->control.tlb_ctl = TLB_CONTROL_FLUSH_ALL_ASID;
+		}
+
+		vcpu->cpu = cd->cpu;
+		vcpu->asid_generation = cd->asid_generation;
+		vcpu->vmcb->control.asid = cd->next_asid++;
+	}
 
 	asm volatile(
         	INSTR_SVM_CLGI "\n\t"

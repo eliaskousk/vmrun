@@ -1,6 +1,6 @@
 //
 // =========================================================
-// x86 Hardware Assisted virtualization demo for AMD-V (SVM)
+// x86 Hardware Assisted Virtualization Demo for AMD-V (SVM)
 // =========================================================
 //
 // Description: A very basic driver that walks
@@ -12,16 +12,23 @@
 //
 // 1. AMD64 Architecture Programmer's Manual
 //    (Vol 2: System Programming)
-// 2. svm.c from the Linux kernel
-//    (KVM sources)
+//
+// 2. KVM from the Linux kernel
+//    (Mostly kvm_main.c, svm.c)
+//
 // 3. Original Intel VT-x vmlaunch demo
 //    (https://github.com/vishmohan/vmlaunch)
 //
-// Author:
+// Copyright (C) 2017: STROMASYS SA (http://www.stromasys.com)
 //
-// Elias Kouskoumvekakis (https://eliaskousk.teamdac.com)
+// Author: Elias Kouskoumvekakis (https://eliaskousk.teamdac.com)
+//
+// This work is licensed under the terms of the GNU GPL, version 2.
+// See the LICENSE file in the top-level directory.
 //
 // ===============================================================
+//
+// Sample Run (TODO: Update)
 //
 // > sudo insmod vmrun.ko
 //
@@ -53,7 +60,8 @@
 #include <asm/virtext.h>
 #include "vmrun.h"
 
-MODULE_LICENSE("Dual BSD/GPL");
+MODULE_AUTHOR("STROMASYS");
+MODULE_LICENSE("GPL");
 
 static DEFINE_PER_CPU(struct svm_vcpu *, local_vcpu);
 static DEFINE_PER_CPU(struct svm_cpu_data *, cpu_data);
@@ -656,9 +664,9 @@ static int vmrun_init(void)
 	printk("vmrun_init: Initializing AMD-V (SVM) vmrun driver\n");
 
 	if (has_svm()) {
-		printk("vmrun_init: SVM is supported and enabled on CPU\n");
+		printk("vmrun_init: SVM is supported and enabled on BIOS\n");
 	} else {
-		printk("vmrun_init: SVM not supported or enabled on CPU, nothing to be done\n");
+		printk("vmrun_init: SVM not supported or disabled on BIOS, nothing to be done\n");
 		goto finish_here;
 	}
 

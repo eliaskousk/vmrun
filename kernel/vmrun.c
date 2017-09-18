@@ -54,6 +54,8 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/mm.h>
+#include <linux/miscdevice.h>
 #include <linux/vmalloc.h>
 #include <linux/slab.h>
 #include <asm/desc.h>
@@ -656,6 +658,259 @@ static void cpu_disable(void *unused)
 	}
 }
 
+static int vmrun_dev_open(struct inode *inode, struct file *filp)
+{
+	struct kvm *kvm = kzalloc(sizeof(struct kvm), GFP_KERNEL);
+	int i;
+
+	if (!kvm)
+		return -ENOMEM;
+
+	spin_lock_init(&kvm->lock);
+	INIT_LIST_HEAD(&kvm->active_mmu_pages);
+	for (i = 0; i < KVM_MAX_VCPUS; ++i) {
+		struct kvm_vcpu *vcpu = &kvm->vcpus[i];
+
+		mutex_init(&vcpu->mutex);
+		vcpu->mmu.root_hpa = INVALID_PAGE;
+		INIT_LIST_HEAD(&vcpu->free_pages);
+	}
+	filp->private_data = kvm;
+	return 0;
+}
+
+static int vmrun_dev_release(struct inode *inode, struct file *filp)
+{
+	struct kvm *kvm = filp->private_data;
+
+	kvm_free_vcpus(kvm);
+	kvm_free_physmem(kvm);
+	kfree(kvm);
+	return 0;
+}
+
+static long vmrun_dev_ioctl(struct file *filp,
+			  unsigned int ioctl, unsigned long arg)
+{
+	struct kvm *kvm = filp->private_data;
+	int r = -EINVAL;
+
+	switch (ioctl) {
+		case KVM_CREATE_VCPU: {
+			r = kvm_dev_ioctl_create_vcpu(kvm, arg);
+			if (r)
+				goto out;
+			break;
+		}
+		case KVM_RUN: {
+			struct kvm_run kvm_run;
+
+			r = -EFAULT;
+			if (copy_from_user(&kvm_run, (void *)arg, sizeof kvm_run))
+				goto out;
+			r = kvm_dev_ioctl_run(kvm, &kvm_run);
+			if (r < 0)
+				goto out;
+			r = -EFAULT;
+			if (copy_to_user((void *)arg, &kvm_run, sizeof kvm_run))
+				goto out;
+			r = 0;
+			break;
+		}
+		case KVM_GET_REGS: {
+			struct kvm_regs kvm_regs;
+
+			r = -EFAULT;
+			if (copy_from_user(&kvm_regs, (void *)arg, sizeof kvm_regs))
+				goto out;
+			r = kvm_dev_ioctl_get_regs(kvm, &kvm_regs);
+			if (r)
+				goto out;
+			r = -EFAULT;
+			if (copy_to_user((void *)arg, &kvm_regs, sizeof kvm_regs))
+				goto out;
+			r = 0;
+			break;
+		}
+		case KVM_SET_REGS: {
+			struct kvm_regs kvm_regs;
+
+			r = -EFAULT;
+			if (copy_from_user(&kvm_regs, (void *)arg, sizeof kvm_regs))
+				goto out;
+			r = kvm_dev_ioctl_set_regs(kvm, &kvm_regs);
+			if (r)
+				goto out;
+			r = 0;
+			break;
+		}
+		case KVM_GET_SREGS: {
+			struct kvm_sregs kvm_sregs;
+
+			r = -EFAULT;
+			if (copy_from_user(&kvm_sregs, (void *)arg, sizeof kvm_sregs))
+				goto out;
+			r = kvm_dev_ioctl_get_sregs(kvm, &kvm_sregs);
+			if (r)
+				goto out;
+			r = -EFAULT;
+			if (copy_to_user((void *)arg, &kvm_sregs, sizeof kvm_sregs))
+				goto out;
+			r = 0;
+			break;
+		}
+		case KVM_SET_SREGS: {
+			struct kvm_sregs kvm_sregs;
+
+			r = -EFAULT;
+			if (copy_from_user(&kvm_sregs, (void *)arg, sizeof kvm_sregs))
+				goto out;
+			r = kvm_dev_ioctl_set_sregs(kvm, &kvm_sregs);
+			if (r)
+				goto out;
+			r = 0;
+			break;
+		}
+		case KVM_TRANSLATE: {
+			struct kvm_translation tr;
+
+			r = -EFAULT;
+			if (copy_from_user(&tr, (void *)arg, sizeof tr))
+				goto out;
+			r = kvm_dev_ioctl_translate(kvm, &tr);
+			if (r)
+				goto out;
+			r = -EFAULT;
+			if (copy_to_user((void *)arg, &tr, sizeof tr))
+				goto out;
+			r = 0;
+			break;
+		}
+		case KVM_INTERRUPT: {
+			struct kvm_interrupt irq;
+
+			r = -EFAULT;
+			if (copy_from_user(&irq, (void *)arg, sizeof irq))
+				goto out;
+			r = kvm_dev_ioctl_interrupt(kvm, &irq);
+			if (r)
+				goto out;
+			r = 0;
+			break;
+		}
+		case KVM_DEBUG_GUEST: {
+			struct kvm_debug_guest dbg;
+
+			r = -EFAULT;
+			if (copy_from_user(&dbg, (void *)arg, sizeof dbg))
+				goto out;
+			r = kvm_dev_ioctl_debug_guest(kvm, &dbg);
+			if (r)
+				goto out;
+			r = 0;
+			break;
+		}
+		case KVM_SET_MEMORY_REGION: {
+			struct kvm_memory_region kvm_mem;
+
+			r = -EFAULT;
+			if (copy_from_user(&kvm_mem, (void *)arg, sizeof kvm_mem))
+				goto out;
+			r = kvm_dev_ioctl_set_memory_region(kvm, &kvm_mem);
+			if (r)
+				goto out;
+			break;
+		}
+		case KVM_GET_DIRTY_LOG: {
+			struct kvm_dirty_log log;
+
+			r = -EFAULT;
+			if (copy_from_user(&log, (void *)arg, sizeof log))
+				goto out;
+			r = kvm_dev_ioctl_get_dirty_log(kvm, &log);
+			if (r)
+				goto out;
+			break;
+		}
+		case KVM_GET_MSRS:
+			r = msr_io(kvm, (void __user *)arg, get_msr, 1);
+			break;
+		case KVM_SET_MSRS:
+			r = msr_io(kvm, (void __user *)arg, do_set_msr, 0);
+			break;
+		case KVM_GET_MSR_INDEX_LIST: {
+			struct kvm_msr_list __user *user_msr_list = (void __user *)arg;
+			struct kvm_msr_list msr_list;
+			unsigned n;
+
+			r = -EFAULT;
+			if (copy_from_user(&msr_list, user_msr_list, sizeof msr_list))
+				goto out;
+			n = msr_list.nmsrs;
+			msr_list.nmsrs = ARRAY_SIZE(msrs_to_save);
+			if (copy_to_user(user_msr_list, &msr_list, sizeof msr_list))
+				goto out;
+			r = -E2BIG;
+			if (n < ARRAY_SIZE(msrs_to_save))
+				goto out;
+			r = -EFAULT;
+			if (copy_to_user(user_msr_list->indices, &msrs_to_save,
+					 sizeof msrs_to_save))
+				goto out;
+			r = 0;
+		}
+		default:
+			;
+	}
+	out:
+	return r;
+}
+
+static struct page *vmrun_dev_nopage(struct vm_area_struct *vma,
+				   unsigned long address,
+				   int *type)
+{
+	struct kvm *kvm = vma->vm_file->private_data;
+	unsigned long pgoff;
+	struct kvm_memory_slot *slot;
+	struct page *page;
+
+	*type = VM_FAULT_MINOR;
+	pgoff = ((address - vma->vm_start) >> PAGE_SHIFT) + vma->vm_pgoff;
+	slot = gfn_to_memslot(kvm, pgoff);
+	if (!slot)
+		return NOPAGE_SIGBUS;
+	page = gfn_to_page(slot, pgoff);
+	if (!page)
+		return NOPAGE_SIGBUS;
+	get_page(page);
+	return page;
+}
+
+static struct vm_operations_struct vmrun_dev_vm_ops = {
+	.nopage = vmrun_dev_nopage,
+};
+
+static int vmrun_dev_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	vma->vm_ops = &vmrun_dev_vm_ops;
+	return 0;
+}
+
+static struct file_operations vmrun_chardev_ops = {
+	.open		= vmrun_dev_open,
+	.release        = vmrun_dev_release,
+	.unlocked_ioctl = vmrun_dev_ioctl,
+	.compat_ioctl   = vmrun_dev_ioctl,
+	.mmap           = vmrun_dev_mmap,
+};
+
+static struct miscdevice vmrun_dev = {
+	MISC_DYNAMIC_MINOR,
+	"vmrun",
+	&vmrun_chardev_ops,
+};
+
 static int vmrun_init(void)
 {
 	int cpu;
@@ -694,15 +949,6 @@ static int vmrun_init(void)
 		printk("vmrun_init: Freed vcpu %d\n", i);
 	}
 
-	on_each_cpu(cpu_disable, 0, 1);
-
-	for_each_online_cpu(cpu)
-		cpu_unsetup(cpu);
-
-	iopm_free();
-
-	asm volatile("sti\n\t");
-
 finish_here:
 	printk("vmrun_init: Done\n");
 	return 0;
@@ -712,10 +958,20 @@ err:
 }
 
 
-static void vmrun_exit(void) {
+static void vmrun_exit(void)
+{
+	int cpu;
 
+	on_each_cpu(cpu_disable, 0, 1);
 
+	for_each_online_cpu(cpu)
+		cpu_unsetup(cpu);
 
+	iopm_free();
+
+	asm volatile("sti\n\t");
+
+	printk("vmrun_exit: Done\n");
 }
 
 module_init(vmrun_init);

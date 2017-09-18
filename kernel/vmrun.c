@@ -19,9 +19,16 @@
 // 3. Original Intel VT-x vmlaunch demo
 //    (https://github.com/vishmohan/vmlaunch)
 //
+// 4. Original vmrunsample demo
+//    (https://github.com/soulxu/vmrunsample)
+//
 // Copyright (C) 2017: STROMASYS SA (http://www.stromasys.com)
 //
-// Author: Elias Kouskoumvekakis (https://eliaskousk.teamdac.com)
+// Authors:
+//
+// - Elias Kouskoumvekakis <eliask.kousk@stromasys.com>
+// - Avi Kivity            <avi@qumranet.com>   (KVM)
+// - Yaniv Kamay           <yaniv@qumranet.com> (KVM)
 //
 // This work is licensed under the terms of the GNU GPL, version 2.
 // See the LICENSE file in the top-level directory.
@@ -57,16 +64,18 @@
 #include <linux/mm.h>
 #include <linux/miscdevice.h>
 #include <linux/vmalloc.h>
+#include <linux/uaccess.h>
 #include <linux/slab.h>
 #include <asm/desc.h>
 #include <asm/virtext.h>
 #include "vmrun.h"
+#include "../user/vmrun.h"
 
 MODULE_AUTHOR("STROMASYS");
 MODULE_LICENSE("GPL");
 
-static DEFINE_PER_CPU(struct svm_vcpu *, local_vcpu);
-static DEFINE_PER_CPU(struct svm_cpu_data *, cpu_data);
+static DEFINE_PER_CPU(struct vmrun_vcpu *, local_vcpu);
+static DEFINE_PER_CPU(struct vmrun_cpu_data *, cpu_data);
 static DEFINE_PER_CPU(struct vmcb *, local_vmcb);
 
 static unsigned long iopm_base;
@@ -205,7 +214,7 @@ static void init_sys_seg(struct vmcb_seg *seg, uint32_t type)
 	seg->base = 0;
 }
 
-static void vmcb_init(struct svm_vcpu *vcpu)
+static void vmcb_init(struct vmrun_vcpu *vcpu)
 {
 	struct vmcb_control_area *control = &vcpu->vmcb->control;
 	struct vmcb_save_area    *save    = &vcpu->vmcb->save;
@@ -258,69 +267,12 @@ static void vmcb_init(struct svm_vcpu *vcpu)
 	vcpu->regs[VCPU_REGS_RIP] = save->rip;
 }
 
-static struct svm_vcpu *vcpu_create(unsigned int id)
-{
-	struct svm_vcpu *vcpu;
-	struct page *vmcb_page;
-	struct page *msrpm_pages;
-	int me = raw_smp_processor_id();
-	int err;
-
-	vcpu = kzalloc(sizeof(struct svm_vcpu), GFP_KERNEL);
-	if (!vcpu) {
-		err = -ENOMEM;
-		goto out;
-	}
-
-	printk("vcpu_create: [%d] Allocated vcpu memory (cpu = %d)\n", id, me);
-
-	vcpu->cpu = me;
-	vcpu->vcpu_id = id;
-
-	err = -ENOMEM;
-	vmcb_page = alloc_page(GFP_KERNEL);
-	if (!vmcb_page)
-		goto free_vcpu;
-
-	printk("vcpu_create: [%d] Allocated vmcb memory\n", id);
-
-	msrpm_pages = alloc_pages(GFP_KERNEL, MSRPM_ALLOC_ORDER);
-	if (!msrpm_pages)
-		goto free_vmcb;
-
-	vcpu->msrpm = page_address(msrpm_pages);
-	memset(vcpu->msrpm, 0xff, PAGE_SIZE * (1 << MSRPM_ALLOC_ORDER));
-
-	printk("vcpu_create: [%d] Allocated MSR permissions bitmap memory\n", id);
-
-	vcpu->vmcb = page_address(vmcb_page);
-	clear_page(vcpu->vmcb);
-	vcpu->vmcb_pa = page_to_pfn(vmcb_page) << PAGE_SHIFT;
-	vcpu->asid_generation = 0;
-	vmcb_init(vcpu);
-
-	printk("vcpu_create: [%d] Initialized vmcb\n", id);
-
-	vcpu->cpu_data = per_cpu(cpu_data, me);
-	per_cpu(local_vcpu, me) = vcpu;
-	per_cpu(local_vmcb, me) = vcpu->vmcb;
-
-	return vcpu;
-
-free_vmcb:
-	__free_page(vmcb_page);
-free_vcpu:
-	kfree(vcpu);
-out:
-	return ERR_PTR(err);
-}
-
 struct system_table {
 	u16 limit;
 	u64 base;
 } __attribute__ ((__packed__));
 
-static void vcpu_setup(struct svm_vcpu *vcpu)
+static void vcpu_setup(struct vmrun_vcpu *vcpu)
 {
 	struct system_table gdt, idt;
 	u64 tr_base, tr_base_lo, tr_base_hi, tr_base_real;
@@ -369,8 +321,8 @@ static void vcpu_setup(struct svm_vcpu *vcpu)
 
 	// SS segment override
 	asm volatile("mov %0,%%rax\n\t"
-		    ".byte 0x36\n\t"
-		    "movq (%%rax), %%rax\n\t" : "=a" (tr_base_lo) : "0" (tr_base));
+		".byte 0x36\n\t"
+		"movq (%%rax), %%rax\n\t" : "=a" (tr_base_lo) : "0" (tr_base));
 
 	tr_base_real = ((tr_base_lo  >> 16) & (0x0ffff)) |
 		       (((tr_base_lo >> 32) & 0x000000ff) << 16) |
@@ -378,8 +330,8 @@ static void vcpu_setup(struct svm_vcpu *vcpu)
 
 	// SS segment override for upper32 bits of base in ia32e mode
 	asm volatile("mov %0,%%rax\n\t"
-		     ".byte 0x36\n\t"
-		     "movq 8(%%rax),%%rax\n\t" : "=a" (tr_base_hi) : "0" (tr_base));
+		".byte 0x36\n\t"
+		"movq 8(%%rax),%%rax\n\t" : "=a" (tr_base_hi) : "0" (tr_base));
 
 	vcpu->vmcb->save.tr.base = tr_base_real | (tr_base_hi << 32);
 
@@ -420,10 +372,10 @@ static void vcpu_setup(struct svm_vcpu *vcpu)
 	vcpu->vmcb->control.clean = 0;
 }
 
-static void vcpu_run(struct svm_vcpu *vcpu)
+static void vcpu_run(struct vmrun_vcpu *vcpu)
 {
 	int cpu = 0;
-	struct svm_cpu_data *cd = NULL;
+	struct vmrun_cpu_data *cd = NULL;
 
 	printk("vcpu_run: Doing vmrun now\n");
 
@@ -451,7 +403,7 @@ static void vcpu_run(struct svm_vcpu *vcpu)
 	}
 
 	asm volatile(
-        	INSTR_SVM_CLGI "\n\t"
+	INSTR_SVM_CLGI "\n\t"
 		"push %%" _ASM_BP " \n\t"
 		"mov %c[rbx](%[vcpu]), %%" _ASM_BX " \n\t"
 		"mov %c[rcx](%[vcpu]), %%" _ASM_CX " \n\t"
@@ -492,29 +444,29 @@ static void vcpu_run(struct svm_vcpu *vcpu)
 		"mov %%r14, %c[r14](%[vcpu]) \n\t"
 		"mov %%r15, %c[r15](%[vcpu]) \n\t"
 		"pop %%" _ASM_BP " \n\t"
-        	INSTR_SVM_STGI "\n\t"
+		INSTR_SVM_STGI "\n\t"
 
-		: // No outputs
+	: // No outputs
 
-		: [vcpu]"a"(vcpu),
-		  [vmcb]"i"(offsetof(struct svm_vcpu, vmcb_pa)),
-		  [rbx]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_RBX])),
-		  [rcx]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_RCX])),
-		  [rdx]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_RDX])),
-		  [rsi]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_RSI])),
-		  [rdi]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_RDI])),
-		  [rbp]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_RBP])),
-		  [r8]"i"(offsetof(struct svm_vcpu,  regs[VCPU_REGS_R8])),
-		  [r9]"i"(offsetof(struct svm_vcpu,  regs[VCPU_REGS_R9])),
-		  [r10]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_R10])),
-		  [r11]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_R11])),
-		  [r12]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_R12])),
-		  [r13]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_R13])),
-		  [r14]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_R14])),
-		  [r15]"i"(offsetof(struct svm_vcpu, regs[VCPU_REGS_R15]))
+	: [vcpu]"a"(vcpu),
+	[vmcb]"i"(offsetof(struct vmrun_vcpu, vmcb_pa)),
+	[rbx]"i"(offsetof(struct vmrun_vcpu, regs[VCPU_REGS_RBX])),
+	[rcx]"i"(offsetof(struct vmrun_vcpu, regs[VCPU_REGS_RCX])),
+	[rdx]"i"(offsetof(struct vmrun_vcpu, regs[VCPU_REGS_RDX])),
+	[rsi]"i"(offsetof(struct vmrun_vcpu, regs[VCPU_REGS_RSI])),
+	[rdi]"i"(offsetof(struct vmrun_vcpu, regs[VCPU_REGS_RDI])),
+	[rbp]"i"(offsetof(struct vmrun_vcpu, regs[VCPU_REGS_RBP])),
+	[r8]"i"(offsetof(struct vmrun_vcpu,  regs[VCPU_REGS_R8])),
+	[r9]"i"(offsetof(struct vmrun_vcpu,  regs[VCPU_REGS_R9])),
+	[r10]"i"(offsetof(struct vmrun_vcpu, regs[VCPU_REGS_R10])),
+	[r11]"i"(offsetof(struct vmrun_vcpu, regs[VCPU_REGS_R11])),
+	[r12]"i"(offsetof(struct vmrun_vcpu, regs[VCPU_REGS_R12])),
+	[r13]"i"(offsetof(struct vmrun_vcpu, regs[VCPU_REGS_R13])),
+	[r14]"i"(offsetof(struct vmrun_vcpu, regs[VCPU_REGS_R14])),
+	[r15]"i"(offsetof(struct vmrun_vcpu, regs[VCPU_REGS_R15]))
 
-		: "cc", "memory", "rbx", "rcx", "rdx", "rsi", "rdi",
-		  "r8", "r9", "r10", "r11" , "r12", "r13", "r14", "r15");
+	: "cc", "memory", "rbx", "rcx", "rdx", "rsi", "rdi",
+		"r8", "r9", "r10", "r11" , "r12", "r13", "r14", "r15");
 
 	printk("vcpu_run: After #vmexit\n");
 	asm volatile("jmp vmexit_handler\n\t");
@@ -543,7 +495,7 @@ static void vcpu_run(struct svm_vcpu *vcpu)
 	put_cpu();
 }
 
-static void vcpu_free(struct svm_vcpu *vcpu)
+static void vcpu_free(struct vmrun_vcpu *vcpu)
 {
 	__free_page(pfn_to_page(vcpu->vmcb_pa >> PAGE_SHIFT));
 	kfree(vcpu);
@@ -551,10 +503,10 @@ static void vcpu_free(struct svm_vcpu *vcpu)
 
 static int cpu_setup(int cpu)
 {
-	struct svm_cpu_data *cd;
+	struct vmrun_cpu_data *cd;
 	int r;
 
-	cd = kzalloc(sizeof(struct svm_cpu_data), GFP_KERNEL);
+	cd = kzalloc(sizeof(struct vmrun_cpu_data), GFP_KERNEL);
 	if (!cd)
 		return -ENOMEM;
 	cd->cpu = cpu;
@@ -569,14 +521,14 @@ static int cpu_setup(int cpu)
 
 	return 0;
 
-err:
+	err:
 	kfree(cd);
 	return r;
 }
 
 static void cpu_unsetup(int cpu)
 {
-	struct svm_cpu_data *cd = per_cpu(cpu_data, cpu);
+	struct vmrun_cpu_data *cd = per_cpu(cpu_data, cpu);
 
 	if (!cd)
 		return;
@@ -590,7 +542,7 @@ static void cpu_unsetup(int cpu)
 
 static void cpu_enable(void *unused)
 {
-	struct svm_cpu_data *cd;
+	struct vmrun_cpu_data *cd;
 	struct desc_struct *gdt;
 	int me = raw_smp_processor_id();
 
@@ -607,8 +559,8 @@ static void cpu_enable(void *unused)
 
 	cd->asid_generation = 1;
 	asm volatile("cpuid\n\t" : "=b" (cd->max_asid)
-				 : "a" (CPUID_EXT_A_SVM_LOCK_LEAF)
-				 : "%rcx","%rdx");
+	: "a" (CPUID_EXT_A_SVM_LOCK_LEAF)
+	: "%rcx","%rdx");
 	cd->max_asid--;
 	cd->next_asid = cd->max_asid + 1;
 
@@ -630,15 +582,15 @@ static void cpu_enable(void *unused)
 	printk("cpu_enable: Enabled SVM on CPU %d\n", me);
 
 	asm volatile("wrmsr\n\t" :
-				 : "c" (MSR_VM_HSAVE_PA), "A" (page_to_pfn(cd->save_area) << PAGE_SHIFT)
-				 :);
+	: "c" (MSR_VM_HSAVE_PA), "A" (page_to_pfn(cd->save_area) << PAGE_SHIFT)
+	:);
 
 	printk("cpu_setup: Registered host save area on CPU %d\n", me);
 }
 
 static void cpu_disable(void *unused)
 {
-	struct svm_cpu_data *cd;
+	struct vmrun_cpu_data *cd;
 	int me = raw_smp_processor_id();
 
 	cd = per_cpu(cpu_data, me);
@@ -658,211 +610,686 @@ static void cpu_disable(void *unused)
 	}
 }
 
-static int vmrun_dev_open(struct inode *inode, struct file *filp)
+static void svm_vcpu_create(struct vmrun_vcpu *vcpu)
 {
-	struct kvm *kvm = kzalloc(sizeof(struct kvm), GFP_KERNEL);
+	struct page *vmcb_page;
+	struct page *msrpm_pages;
+	int me = raw_smp_processor_id();
+	int err;
+
+	vcpu = kzalloc(sizeof(struct vmrun_vcpu), GFP_KERNEL);
+	if (!vcpu) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	printk("vcpu_create: [%d] Allocated vcpu memory (cpu = %d)\n", id, me);
+
+	vcpu->cpu = me;
+	vcpu->vcpu_id = id;
+
+	err = -ENOMEM;
+	vmcb_page = alloc_page(GFP_KERNEL);
+	if (!vmcb_page)
+		goto free_vcpu;
+
+	printk("vcpu_create: [%d] Allocated vmcb memory\n", id);
+
+	msrpm_pages = alloc_pages(GFP_KERNEL, MSRPM_ALLOC_ORDER);
+	if (!msrpm_pages)
+		goto free_vmcb;
+
+	vcpu->msrpm = page_address(msrpm_pages);
+	memset(vcpu->msrpm, 0xff, PAGE_SIZE * (1 << MSRPM_ALLOC_ORDER));
+
+	printk("vcpu_create: [%d] Allocated MSR permissions bitmap memory\n", id);
+
+	vcpu->vmcb = page_address(vmcb_page);
+	clear_page(vcpu->vmcb);
+	vcpu->vmcb_pa = page_to_pfn(vmcb_page) << PAGE_SHIFT;
+	vcpu->asid_generation = 0;
+	vmcb_init(vcpu);
+
+	printk("vcpu_create: [%d] Initialized vmcb\n", id);
+
+	vcpu->cpu_data = per_cpu(cpu_data, me);
+	per_cpu(local_vcpu, me) = vcpu;
+	per_cpu(local_vmcb, me) = vcpu->vmcb;
+
+	return vcpu;
+
+free_vmcb:
+	__free_page(vmcb_page);
+free_vcpu:
+	kfree(vcpu);
+out:
+	return ERR_PTR(err);
+}
+
+/*
+ * Free any memory in @free but not in @dont.
+ */
+static void vmrun_free_physmem_slot(struct vmrun_memory_slot *free,
+				  struct vmrun_memory_slot *dont)
+{
 	int i;
 
-	if (!kvm)
+	if (!dont || free->phys_mem != dont->phys_mem)
+		if (free->phys_mem) {
+			for (i = 0; i < free->npages; ++i)
+				__free_page(free->phys_mem[i]);
+			vfree(free->phys_mem);
+		}
+
+	if (!dont || free->dirty_bitmap != dont->dirty_bitmap)
+		vfree(free->dirty_bitmap);
+
+	free->phys_mem = 0;
+	free->npages = 0;
+	free->dirty_bitmap = 0;
+}
+
+static void vmrun_free_physmem(struct vmrun *vmrun)
+{
+	int i;
+
+	for (i = 0; i < vmrun->nmemslots; ++i)
+		vmrun_free_physmem_slot(&vmrun->memslots[i], 0);
+}
+
+static void vmrun_free_vcpu(struct vmrun_vcpu *vcpu)
+{
+	vcpu_free(vcpu);
+	//vmrun_mmu_destroy(vcpu);
+}
+
+static void vmrun_free_vcpus(struct vmrun *vmrun)
+{
+	unsigned int i;
+
+	for (i = 0; i < VMRUN_MAX_VCPUS; ++i)
+		vmrun_free_vcpu(&vmrun->vcpus[i]);
+}
+
+static int vmrun_dev_ioctl_vcpu_create(struct vmrun *vmrun, int n) {
+	int r;
+	struct vmrun_vcpu *vcpu;
+
+	r = -EINVAL;
+	if (n < 0 || n >= VMRUN_MAX_VCPUS)
+		goto out;
+
+	vcpu = &vmrun->vcpus[n];
+
+	mutex_lock(&vcpu->mutex);
+
+	if (vcpu->vmcb) {
+		mutex_unlock(&vcpu->mutex);
+		return -EEXIST;
+	}
+
+	vcpu->cpu = -1;  /* First load will set up TR */
+	vcpu->vmrun = vmrun;
+	r = svm_vcpu_create(vcpu);
+	if (r < 0)
+		goto out_free_vcpus;
+
+	vcpu_load(vcpu);
+
+	r = vcpu_setup(vcpu);
+	if (r >= 0)
+		r = vmrun_mmu_init(vcpu);
+
+	vcpu_put(vcpu);
+
+	if (r < 0)
+		goto out_free_vcpus;
+
+	return 0;
+
+	out_free_vcpus:
+	vmrun_free_vcpu(vcpu);
+	mutex_unlock(&vcpu->mutex);
+	out:
+	return r;
+}
+
+static int vmrun_dev_ioctl_vcpu_run(struct vmrun *vmrun, struct vmrun_run *run)
+{
+	struct vmrun_vcpu *vcpu;
+	int r;
+
+	if (run->vcpu < 0 || run->vcpu >= VMRUN_MAX_VCPUS)
+		return -EINVAL;
+
+	vcpu = vcpu_load(vmrun, run->vcpu);
+
+	if (!vcpu)
+		return -ENOENT;
+
+	if (run->emulated) {
+		svm_skip_emulated_instruction(vcpu);
+		run->emulated = 0;
+	}
+
+	if (run->mmio_completed) {
+		memcpy(vcpu->mmio_data, run->mmio.data, 8);
+		vcpu->mmio_read_completed = 1;
+	}
+
+	vcpu->mmio_needed = 0;
+
+	r = vcpu_run(vcpu, run);
+
+	vcpu_put(vcpu);
+
+	return r;
+}
+
+static int vmrun_dev_ioctl_get_regs(struct vmrun *vmrun, struct vmrun_regs *regs)
+{
+	struct vmrun_vcpu *vcpu;
+
+	if (regs->vcpu < 0 || regs->vcpu >= VMRUN_MAX_VCPUS)
+		return -EINVAL;
+
+	vcpu = vcpu_load(vmrun, regs->vcpu);
+
+	if (!vcpu)
+		return -ENOENT;
+
+	svm_cache_regs(vcpu);
+
+	regs->rax = vcpu->regs[VCPU_REGS_RAX];
+	regs->rbx = vcpu->regs[VCPU_REGS_RBX];
+	regs->rcx = vcpu->regs[VCPU_REGS_RCX];
+	regs->rdx = vcpu->regs[VCPU_REGS_RDX];
+	regs->rsi = vcpu->regs[VCPU_REGS_RSI];
+	regs->rdi = vcpu->regs[VCPU_REGS_RDI];
+	regs->rsp = vcpu->regs[VCPU_REGS_RSP];
+	regs->rbp = vcpu->regs[VCPU_REGS_RBP];
+	regs->r8 = vcpu->regs[VCPU_REGS_R8];
+	regs->r9 = vcpu->regs[VCPU_REGS_R9];
+	regs->r10 = vcpu->regs[VCPU_REGS_R10];
+	regs->r11 = vcpu->regs[VCPU_REGS_R11];
+	regs->r12 = vcpu->regs[VCPU_REGS_R12];
+	regs->r13 = vcpu->regs[VCPU_REGS_R13];
+	regs->r14 = vcpu->regs[VCPU_REGS_R14];
+	regs->r15 = vcpu->regs[VCPU_REGS_R15];
+	regs->rip = vcpu->rip;
+	regs->rflags = svm_get_rflags(vcpu);
+
+	/*
+	 * Don't leak debug flags in case they were set for guest debugging
+	 */
+	if (vcpu->guest_debug.enabled && vcpu->guest_debug.singlestep)
+		regs->rflags &= ~(X86_EFLAGS_TF | X86_EFLAGS_RF);
+
+	vcpu_put(vcpu);
+
+	return 0;
+}
+
+static int vmrun_dev_ioctl_set_regs(struct vmrun *vmrun, struct vmrun_regs *regs)
+{
+	struct vmrun_vcpu *vcpu;
+
+	if (regs->vcpu < 0 || regs->vcpu >= VMRUN_MAX_VCPUS)
+		return -EINVAL;
+
+	vcpu = vcpu_load(vmrun, regs->vcpu);
+
+	if (!vcpu)
+		return -ENOENT;
+
+	vcpu->regs[VCPU_REGS_RAX] = regs->rax;
+	vcpu->regs[VCPU_REGS_RBX] = regs->rbx;
+	vcpu->regs[VCPU_REGS_RCX] = regs->rcx;
+	vcpu->regs[VCPU_REGS_RDX] = regs->rdx;
+	vcpu->regs[VCPU_REGS_RSI] = regs->rsi;
+	vcpu->regs[VCPU_REGS_RDI] = regs->rdi;
+	vcpu->regs[VCPU_REGS_RSP] = regs->rsp;
+	vcpu->regs[VCPU_REGS_RBP] = regs->rbp;
+	vcpu->regs[VCPU_REGS_R8]  = regs->r8;
+	vcpu->regs[VCPU_REGS_R9]  = regs->r9;
+	vcpu->regs[VCPU_REGS_R10] = regs->r10;
+	vcpu->regs[VCPU_REGS_R11] = regs->r11;
+	vcpu->regs[VCPU_REGS_R12] = regs->r12;
+	vcpu->regs[VCPU_REGS_R13] = regs->r13;
+	vcpu->regs[VCPU_REGS_R14] = regs->r14;
+	vcpu->regs[VCPU_REGS_R15] = regs->r15;
+
+	vcpu->rip = regs->rip;
+
+	svm_set_rflags(vcpu, regs->rflags);
+	svm_decache_regs(vcpu);
+
+	vcpu_put(vcpu);
+
+	return 0;
+}
+
+static void get_segment(struct vmrun_vcpu *vcpu,
+			struct vmrun_segment *var, int seg)
+{
+	return vmrun_arch_ops->get_segment(vcpu, var, seg);
+}
+
+static int vmrun_dev_ioctl_get_sregs(struct vmrun *vmrun, struct vmrun_sregs *sregs)
+{
+	struct vmrun_vcpu *vcpu;
+	struct descriptor_table dt;
+
+	if (sregs->vcpu < 0 || sregs->vcpu >= VMRUN_MAX_VCPUS)
+		return -EINVAL;
+
+	vcpu = vcpu_load(vmrun, sregs->vcpu);
+
+	if (!vcpu)
+		return -ENOENT;
+
+	get_segment(vcpu, &sregs->cs,  VCPU_SREG_CS);
+	get_segment(vcpu, &sregs->ds,  VCPU_SREG_DS);
+	get_segment(vcpu, &sregs->es,  VCPU_SREG_ES);
+	get_segment(vcpu, &sregs->fs,  VCPU_SREG_FS);
+	get_segment(vcpu, &sregs->gs,  VCPU_SREG_GS);
+	get_segment(vcpu, &sregs->ss,  VCPU_SREG_SS);
+	get_segment(vcpu, &sregs->tr,  VCPU_SREG_TR);
+	get_segment(vcpu, &sregs->ldt, VCPU_SREG_LDTR);
+
+	get_idt(vcpu, &dt);
+	sregs->idt.limit = dt.limit;
+	sregs->idt.base  = dt.base;
+	get_gdt(vcpu, &dt);
+	sregs->gdt.limit = dt.limit;
+	sregs->gdt.base  = dt.base;
+	sregs->cr0       = vcpu->cr0;
+	sregs->cr2       = vcpu->cr2;
+	sregs->cr3       = vcpu->cr3;
+	sregs->cr4       = vcpu->cr4;
+	sregs->cr8       = vcpu->cr8;
+	sregs->efer      = vcpu->shadow_efer;
+	sregs->apic_base = vcpu->apic_base;
+
+	memcpy(sregs->interrupt_bitmap,
+	       vcpu->irq_pending,
+	       sizeof sregs->interrupt_bitmap);
+
+	vcpu_put(vcpu);
+
+	return 0;
+}
+
+static void set_segment(struct vmrun_vcpu *vcpu,
+			struct vmrun_segment *var, int seg)
+{
+	return vmrun_arch_ops->set_segment(vcpu, var, seg);
+}
+
+static int vmrun_dev_ioctl_set_sregs(struct vmrun *vmrun, struct vmrun_sregs *sregs)
+{
+	struct vmrun_vcpu *vcpu;
+	int mmu_reset_needed = 0;
+	int i;
+	struct descriptor_table dt;
+
+	if (sregs->vcpu < 0 || sregs->vcpu >= VMRUN_MAX_VCPUS)
+		return -EINVAL;
+
+	vcpu = vcpu_load(vmrun, sregs->vcpu);
+
+	if (!vcpu)
+		return -ENOENT;
+
+	set_segment(vcpu, &sregs->cs,  VCPU_SREG_CS);
+	set_segment(vcpu, &sregs->ds,  VCPU_SREG_DS);
+	set_segment(vcpu, &sregs->es,  VCPU_SREG_ES);
+	set_segment(vcpu, &sregs->fs,  VCPU_SREG_FS);
+	set_segment(vcpu, &sregs->gs,  VCPU_SREG_GS);
+	set_segment(vcpu, &sregs->ss,  VCPU_SREG_SS);
+	set_segment(vcpu, &sregs->tr,  VCPU_SREG_TR);
+	set_segment(vcpu, &sregs->ldt, VCPU_SREG_LDTR);
+
+	dt.limit = sregs->idt.limit;
+	dt.base = sregs->idt.base;
+	set_idt(vcpu, &dt);
+	dt.limit = sregs->gdt.limit;
+	dt.base = sregs->gdt.base;
+	set_gdt(vcpu, &dt);
+
+	vcpu->cr2 = sregs->cr2;
+	mmu_reset_needed |= vcpu->cr3 != sregs->cr3;
+	vcpu->cr3 = sregs->cr3;
+	vcpu->cr8 = sregs->cr8;
+
+	mmu_reset_needed |= vcpu->shadow_efer != sregs->efer;
+
+	set_efer(vcpu, sregs->efer);
+
+	vcpu->apic_base = sregs->apic_base;
+
+	mmu_reset_needed |= vcpu->cr0 != sregs->cr0;
+	set_cr0_no_modeswitch(vcpu, sregs->cr0);
+
+	mmu_reset_needed |= vcpu->cr4 != sregs->cr4;
+	set_cr4(vcpu, sregs->cr4);
+
+	if (mmu_reset_needed)
+		vmrun_mmu_reset_context(vcpu);
+
+	memcpy(vcpu->irq_pending,
+	       sregs->interrupt_bitmap,
+	       sizeof vcpu->irq_pending);
+
+	vcpu->irq_summary = 0;
+
+	for (i = 0; i < NR_IRQ_WORDS; ++i)
+		if (vcpu->irq_pending[i])
+			__set_bit(i, &vcpu->irq_summary);
+
+	vcpu_put(vcpu);
+
+	return 0;
+}
+
+/*
+ * Allocate some memory and give it an address in the guest physical address
+ * space.
+ *
+ * Discontiguous memory is allowed, mostly for framebuffers.
+ */
+static int vmrun_dev_ioctl_set_memory_region(struct vmrun *vmrun,
+					     struct vmrun_memory_region *mem)
+{
+	int r;
+	gfn_t base_gfn;
+	unsigned long npages;
+	unsigned long i;
+	struct vmrun_memory_slot *memslot;
+	struct vmrun_memory_slot old, new;
+	int memory_config_version;
+
+	r = -EINVAL;
+
+	/* General sanity checks */
+	if (mem->memory_size & (PAGE_SIZE - 1))
+		goto out;
+
+	if (mem->guest_phys_addr & (PAGE_SIZE - 1))
+		goto out;
+
+	if (mem->slot >= VMRUN_MEMORY_SLOTS)
+		goto out;
+
+	if (mem->guest_phys_addr + mem->memory_size < mem->guest_phys_addr)
+		goto out;
+
+	memslot  = &vmrun->memslots[mem->slot];
+	base_gfn = mem->guest_phys_addr >> PAGE_SHIFT;
+	npages   = mem->memory_size >> PAGE_SHIFT;
+
+	if (!npages)
+		mem->flags &= ~VMRUN_MEM_LOG_DIRTY_PAGES;
+
+raced:
+	spin_lock(&vmrun->lock);
+
+	memory_config_version = vmrun->memory_config_version;
+	new = old = *memslot;
+
+	new.base_gfn = base_gfn;
+	new.npages = npages;
+	new.flags = mem->flags;
+
+	/* Disallow changing a memory slot's size. */
+	r = -EINVAL;
+	if (npages && old.npages && npages != old.npages)
+		goto out_unlock;
+
+	/* Check for overlaps */
+	r = -EEXIST;
+	for (i = 0; i < VMRUN_MEMORY_SLOTS; ++i) {
+		struct vmrun_memory_slot *s = &vmrun->memslots[i];
+
+		if (s == memslot)
+			continue;
+		if (!((base_gfn + npages <= s->base_gfn) ||
+		      (base_gfn >= s->base_gfn + s->npages)))
+			goto out_unlock;
+	}
+
+	/*
+	 * Do memory allocations outside lock.  memory_config_version will
+	 * detect any races.
+	 */
+	spin_unlock(&vmrun->lock);
+
+	/* Deallocate if slot is being removed */
+	if (!npages)
+		new.phys_mem = 0;
+
+	/* Free page dirty bitmap if unneeded */
+	if (!(new.flags & VMRUN_MEM_LOG_DIRTY_PAGES))
+		new.dirty_bitmap = 0;
+
+	r = -ENOMEM;
+
+	/* Allocate if a slot is being created */
+	if (npages && !new.phys_mem) {
+		new.phys_mem = vmalloc(npages * sizeof(struct page *));
+
+		if (!new.phys_mem)
+			goto out_free;
+
+		memset(new.phys_mem, 0, npages * sizeof(struct page *));
+
+		for (i = 0; i < npages; ++i) {
+			new.phys_mem[i] = alloc_page(GFP_HIGHUSER
+						     | __GFP_ZERO);
+
+			if (!new.phys_mem[i])
+				goto out_free;
+		}
+	}
+
+	/* Allocate page dirty bitmap if needed */
+	if ((new.flags & VMRUN_MEM_LOG_DIRTY_PAGES) && !new.dirty_bitmap) {
+		unsigned dirty_bytes = ALIGN(npages, BITS_PER_LONG) / 8;
+
+		new.dirty_bitmap = vmalloc(dirty_bytes);
+
+		if (!new.dirty_bitmap)
+			goto out_free;
+
+		memset(new.dirty_bitmap, 0, dirty_bytes);
+	}
+
+	spin_lock(&vmrun->lock);
+
+	if (memory_config_version != vmrun->memory_config_version) {
+		spin_unlock(&vmrun->lock);
+		vmrun_free_physmem_slot(&new, &old);
+		goto raced;
+	}
+
+	r = -EAGAIN;
+	if (vmrun->busy)
+		goto out_unlock;
+
+	if (mem->slot >= vmrun->nmemslots)
+		vmrun->nmemslots = mem->slot + 1;
+
+	*memslot = new;
+	++vmrun->memory_config_version;
+
+	spin_unlock(&vmrun->lock);
+
+	for (i = 0; i < VMRUN_MAX_VCPUS; ++i) {
+		struct vmrun_vcpu *vcpu;
+
+		vcpu = vcpu_load(vmrun, i);
+
+		if (!vcpu)
+			continue;
+		vmrun_mmu_reset_context(vcpu);
+
+		vcpu_put(vcpu);
+	}
+
+	vmrun_free_physmem_slot(&old, &new);
+	return 0;
+
+out_unlock:
+	spin_unlock(&vmrun->lock);
+
+out_free:
+	vmrun_free_physmem_slot(&new, &old);
+
+out:
+	return r;
+}
+
+static int vmrun_dev_open(struct inode *inode, struct file *filp)
+{
+	struct vmrun *vmrun = kzalloc(sizeof(struct vmrun), GFP_KERNEL);
+	int i;
+
+	if (!vmrun)
 		return -ENOMEM;
 
-	spin_lock_init(&kvm->lock);
-	INIT_LIST_HEAD(&kvm->active_mmu_pages);
-	for (i = 0; i < KVM_MAX_VCPUS; ++i) {
-		struct kvm_vcpu *vcpu = &kvm->vcpus[i];
+	spin_lock_init(&vmrun->lock);
+
+	INIT_LIST_HEAD(&vmrun->active_mmu_pages);
+
+	for (i = 0; i < VMRUN_MAX_VCPUS; ++i) {
+		struct vmrun_vcpu *vcpu = &vmrun->vcpus[i];
 
 		mutex_init(&vcpu->mutex);
 		vcpu->mmu.root_hpa = INVALID_PAGE;
 		INIT_LIST_HEAD(&vcpu->free_pages);
 	}
-	filp->private_data = kvm;
+
+	filp->private_data = vmrun;
+
 	return 0;
 }
 
 static int vmrun_dev_release(struct inode *inode, struct file *filp)
 {
-	struct kvm *kvm = filp->private_data;
+	struct vmrun *vmrun = filp->private_data;
 
-	kvm_free_vcpus(kvm);
-	kvm_free_physmem(kvm);
-	kfree(kvm);
+	vmrun_free_vcpus(vmrun);
+	vmrun_free_physmem(vmrun);
+	kfree(vmrun);
 	return 0;
 }
 
 static long vmrun_dev_ioctl(struct file *filp,
-			  unsigned int ioctl, unsigned long arg)
+			    unsigned int ioctl,
+			    unsigned long arg)
 {
-	struct kvm *kvm = filp->private_data;
+	struct vmrun *vmrun = filp->private_data;
 	int r = -EINVAL;
 
 	switch (ioctl) {
-		case KVM_CREATE_VCPU: {
-			r = kvm_dev_ioctl_create_vcpu(kvm, arg);
+		case VMRUN_VCPU_CREATE: {
+			r = vmrun_dev_ioctl_vcpu_create(vmrun, arg);
 			if (r)
 				goto out;
 			break;
 		}
-		case KVM_RUN: {
-			struct kvm_run kvm_run;
+
+		case VMRUN_VCPU_RUN: {
+			struct vmrun_run run;
 
 			r = -EFAULT;
-			if (copy_from_user(&kvm_run, (void *)arg, sizeof kvm_run))
+			if (copy_from_user(&run, (void *)arg, sizeof run))
 				goto out;
-			r = kvm_dev_ioctl_run(kvm, &kvm_run);
+			r = vmrun_dev_ioctl_vcpu_run(vmrun, &run);
 			if (r < 0)
 				goto out;
 			r = -EFAULT;
-			if (copy_to_user((void *)arg, &kvm_run, sizeof kvm_run))
+			if (copy_to_user((void *)arg, &run, sizeof run))
 				goto out;
 			r = 0;
 			break;
 		}
-		case KVM_GET_REGS: {
-			struct kvm_regs kvm_regs;
+		
+		case VMRUN_GET_REGS: {
+			struct vmrun_regs regs;
 
 			r = -EFAULT;
-			if (copy_from_user(&kvm_regs, (void *)arg, sizeof kvm_regs))
+			if (copy_from_user(&regs, (void *)arg, sizeof regs))
 				goto out;
-			r = kvm_dev_ioctl_get_regs(kvm, &kvm_regs);
+			r = vmrun_dev_ioctl_get_regs(vmrun, &regs);
 			if (r)
 				goto out;
 			r = -EFAULT;
-			if (copy_to_user((void *)arg, &kvm_regs, sizeof kvm_regs))
+			if (copy_to_user((void *)arg, &regs, sizeof regs))
 				goto out;
 			r = 0;
 			break;
 		}
-		case KVM_SET_REGS: {
-			struct kvm_regs kvm_regs;
+		
+		case VMRUN_SET_REGS: {
+			struct vmrun_regs regs;
 
 			r = -EFAULT;
-			if (copy_from_user(&kvm_regs, (void *)arg, sizeof kvm_regs))
+			if (copy_from_user(&regs, (void *)arg, sizeof regs))
 				goto out;
-			r = kvm_dev_ioctl_set_regs(kvm, &kvm_regs);
-			if (r)
-				goto out;
-			r = 0;
-			break;
-		}
-		case KVM_GET_SREGS: {
-			struct kvm_sregs kvm_sregs;
-
-			r = -EFAULT;
-			if (copy_from_user(&kvm_sregs, (void *)arg, sizeof kvm_sregs))
-				goto out;
-			r = kvm_dev_ioctl_get_sregs(kvm, &kvm_sregs);
-			if (r)
-				goto out;
-			r = -EFAULT;
-			if (copy_to_user((void *)arg, &kvm_sregs, sizeof kvm_sregs))
-				goto out;
-			r = 0;
-			break;
-		}
-		case KVM_SET_SREGS: {
-			struct kvm_sregs kvm_sregs;
-
-			r = -EFAULT;
-			if (copy_from_user(&kvm_sregs, (void *)arg, sizeof kvm_sregs))
-				goto out;
-			r = kvm_dev_ioctl_set_sregs(kvm, &kvm_sregs);
+			r = vmrun_dev_ioctl_set_regs(vmrun, &regs);
 			if (r)
 				goto out;
 			r = 0;
 			break;
 		}
-		case KVM_TRANSLATE: {
-			struct kvm_translation tr;
+		
+		case VMRUN_GET_SREGS: {
+			struct vmrun_sregs sregs;
 
 			r = -EFAULT;
-			if (copy_from_user(&tr, (void *)arg, sizeof tr))
+			if (copy_from_user(&sregs, (void *)arg, sizeof sregs))
 				goto out;
-			r = kvm_dev_ioctl_translate(kvm, &tr);
+			r = vmrun_dev_ioctl_get_sregs(vmrun, &sregs);
 			if (r)
 				goto out;
 			r = -EFAULT;
-			if (copy_to_user((void *)arg, &tr, sizeof tr))
+			if (copy_to_user((void *)arg, &sregs, sizeof sregs))
 				goto out;
 			r = 0;
 			break;
 		}
-		case KVM_INTERRUPT: {
-			struct kvm_interrupt irq;
+		
+		case VMRUN_SET_SREGS: {
+			struct vmrun_sregs sregs;
 
 			r = -EFAULT;
-			if (copy_from_user(&irq, (void *)arg, sizeof irq))
+			if (copy_from_user(&sregs, (void *)arg, sizeof sregs))
 				goto out;
-			r = kvm_dev_ioctl_interrupt(kvm, &irq);
-			if (r)
-				goto out;
-			r = 0;
-			break;
-		}
-		case KVM_DEBUG_GUEST: {
-			struct kvm_debug_guest dbg;
-
-			r = -EFAULT;
-			if (copy_from_user(&dbg, (void *)arg, sizeof dbg))
-				goto out;
-			r = kvm_dev_ioctl_debug_guest(kvm, &dbg);
+			r = vmrun_dev_ioctl_set_sregs(vmrun, &sregs);
 			if (r)
 				goto out;
 			r = 0;
 			break;
 		}
-		case KVM_SET_MEMORY_REGION: {
-			struct kvm_memory_region kvm_mem;
+
+		case VMRUN_SET_USER_MEMORY_REGION: {
+			struct vmrun_memory_region mem;
 
 			r = -EFAULT;
-			if (copy_from_user(&kvm_mem, (void *)arg, sizeof kvm_mem))
+			if (copy_from_user(&mem, (void *)arg, sizeof mem))
 				goto out;
-			r = kvm_dev_ioctl_set_memory_region(kvm, &kvm_mem);
+			r = vmrun_dev_ioctl_set_memory_region(vmrun, &mem);
 			if (r)
 				goto out;
 			break;
 		}
-		case KVM_GET_DIRTY_LOG: {
-			struct kvm_dirty_log log;
 
-			r = -EFAULT;
-			if (copy_from_user(&log, (void *)arg, sizeof log))
-				goto out;
-			r = kvm_dev_ioctl_get_dirty_log(kvm, &log);
-			if (r)
-				goto out;
-			break;
-		}
-		case KVM_GET_MSRS:
-			r = msr_io(kvm, (void __user *)arg, get_msr, 1);
-			break;
-		case KVM_SET_MSRS:
-			r = msr_io(kvm, (void __user *)arg, do_set_msr, 0);
-			break;
-		case KVM_GET_MSR_INDEX_LIST: {
-			struct kvm_msr_list __user *user_msr_list = (void __user *)arg;
-			struct kvm_msr_list msr_list;
-			unsigned n;
-
-			r = -EFAULT;
-			if (copy_from_user(&msr_list, user_msr_list, sizeof msr_list))
-				goto out;
-			n = msr_list.nmsrs;
-			msr_list.nmsrs = ARRAY_SIZE(msrs_to_save);
-			if (copy_to_user(user_msr_list, &msr_list, sizeof msr_list))
-				goto out;
-			r = -E2BIG;
-			if (n < ARRAY_SIZE(msrs_to_save))
-				goto out;
-			r = -EFAULT;
-			if (copy_to_user(user_msr_list->indices, &msrs_to_save,
-					 sizeof msrs_to_save))
-				goto out;
-			r = 0;
-		}
 		default:
 			;
 	}
-	out:
+
+out:
 	return r;
 }
 
@@ -870,14 +1297,14 @@ static struct page *vmrun_dev_nopage(struct vm_area_struct *vma,
 				   unsigned long address,
 				   int *type)
 {
-	struct kvm *kvm = vma->vm_file->private_data;
+	struct vmrun *vmrun = vma->vm_file->private_data;
 	unsigned long pgoff;
-	struct kvm_memory_slot *slot;
+	struct vmrun_memory_slot *slot;
 	struct page *page;
 
 	*type = VM_FAULT_MINOR;
 	pgoff = ((address - vma->vm_start) >> PAGE_SHIFT) + vma->vm_pgoff;
-	slot = gfn_to_memslot(kvm, pgoff);
+	slot = gfn_to_memslot(vmrun, pgoff);
 	if (!slot)
 		return NOPAGE_SIGBUS;
 	page = gfn_to_page(slot, pgoff);
@@ -922,12 +1349,12 @@ static int vmrun_init(void)
 		printk("vmrun_init: SVM is supported and enabled on BIOS\n");
 	} else {
 		printk("vmrun_init: SVM not supported or disabled on BIOS, nothing to be done\n");
-		goto finish_here;
+		goto err;
 	}
 
 	r = iopm_allocate();
 	if (r)
-		goto err;
+		goto err_iopm;
 
 	for_each_online_cpu(cpu) {
 		r = cpu_setup(cpu);
@@ -937,26 +1364,41 @@ static int vmrun_init(void)
 
 	on_each_cpu(cpu_enable, 0, 1);
 
-	for (unsigned int i = 0; i < NR_VCPUS; i++) {
-
-		struct svm_vcpu *vcpu = vcpu_create(i);
-		printk("vmrun_init: Created vcpu %d\n", i);
-		vcpu_setup(vcpu);
-		printk("vmrun_init: Setup vcpu %d\n", i);
-		vcpu_run(vcpu);
-		printk("vmrun_init: Run vcpu %d\n", i);
-		vcpu_free(vcpu);
-		printk("vmrun_init: Freed vcpu %d\n", i);
+	r = misc_register(&vmrun_dev);
+	if (r) {
+		printk (KERN_ERR "vmrun_init: Misc device register failed\n");
+		goto err;
 	}
 
-finish_here:
 	printk("vmrun_init: Done\n");
-	return 0;
+	
+	return r;
+
 err:
+	on_each_cpu(cpu_disable, 0, 1);
+	
+	for_each_online_cpu(cpu)
+		cpu_unsetup(cpu);
+	
+	iopm_free();
+	
+
+//	for (unsigned int i = 0; i < NR_VCPUS; i++) {
+//
+//		struct vmrun_vcpu *vcpu = vcpu_create(i);
+//		printk("vmrun_init: Created vcpu %d\n", i);
+//		vcpu_setup(vcpu);
+//		printk("vmrun_init: Setup vcpu %d\n", i);
+//		vcpu_run(vcpu);
+//		printk("vmrun_init: Run vcpu %d\n", i);
+//		vcpu_free(vcpu);
+//		printk("vmrun_init: Freed vcpu %d\n", i);
+//	}
+	
+err_iopm:
 	printk("vmrun_init: Error\n");
 	return r;
 }
-
 
 static void vmrun_exit(void)
 {
@@ -968,8 +1410,6 @@ static void vmrun_exit(void)
 		cpu_unsetup(cpu);
 
 	iopm_free();
-
-	asm volatile("sti\n\t");
 
 	printk("vmrun_exit: Done\n");
 }

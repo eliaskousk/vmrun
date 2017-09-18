@@ -1,29 +1,47 @@
 //
 // =========================================================
-// x86 Hardware Assisted virtualization demo for AMD-V (SVM)
+// x86 Hardware Assisted Virtualization Demo for AMD-V (SVM)
 // =========================================================
 //
-// Description: A very basic driver that walks
-// through all the steps to do a successful vmrun.
+// Description: A very basic driver and associated user app
+// that walks through all the steps to do a successful vmrun.
 // After vmrun, the guest code does a vmmcall and #vmexits
 // back to the host. The guest state mirrors the host.
 //
-// References:
-
+// References for study:
+//
 // 1. AMD64 Architecture Programmer's Manual
 //    (Vol 2: System Programming)
-// 2. svm.[c|h] from the Linux kernel
-//    (KVM sources)
+//
+// 2. KVM from the Linux kernel
+//    (Mostly kvm_main.c, svm.c)
+//
 // 3. Original Intel VT-x vmlaunch demo
 //    (https://github.com/vishmohan/vmlaunch)
 //
-// Author:
+// 4. Original vmrunsample demo
+//    (https://github.com/soulxu/vmrunsample)
 //
-// Elias Kouskoumvekakis (https://eliaskousk.teamdac.com)
+// Copyright (C) 2017 STROMASYS SA <http://www.stromasys.com>
+// Copyright (C) 2006 Qumranet, Inc.
+//
+// Authors:
+//
+// - Elias Kouskoumvekakis <eliask.kousk@stromasys.com>
+// - Avi Kivity            <avi@qumranet.com>   (KVM)
+// - Yaniv Kamay           <yaniv@qumranet.com> (KVM)
+//
+// This work is licensed under the terms of the GNU GPL, version 2.
+// See the LICENSE file in the top-level directory.
 //
 
 #ifndef VMRUN_H
 #define VMRUN_H
+
+#include <linux/types.h>
+#include <linux/list.h>
+#include <linux/mutex.h>
+#include <linux/spinlock.h>
 
 #define CPUID_EXT_1_SVM_LEAF      0x80000001
 #define CPUID_EXT_1_SVM_BIT       0x2
@@ -45,7 +63,10 @@
 #define SEG_TYPE_LDT              2
 #define SEG_TYPE_AVAIL_TSS64      9
 
-#define NR_VCPUS                  1
+#define INVALID_PAGE              (~(hpa_t)0)
+
+#define VMRUN_MAX_VCPUS           1
+#define VMRUN_MEMORY_SLOTS        4
 
 #define INSTR_SVM_VMRUN           ".byte 0x0f, 0x01, 0xd8"
 #define INSTR_SVM_VMMCALL         ".byte 0x0f, 0x01, 0xd9"
@@ -53,6 +74,25 @@
 #define INSTR_SVM_VMSAVE          ".byte 0x0f, 0x01, 0xdb"
 #define INSTR_SVM_STGI            ".byte 0x0f, 0x01, 0xdc"
 #define INSTR_SVM_CLGI            ".byte 0x0f, 0x01, 0xdd"
+
+/*
+ * Address types:
+ *
+ *  gva - guest virtual address
+ *  gpa - guest physical address
+ *  gfn - guest frame number
+ *  hva - host virtual address
+ *  hpa - host physical address
+ *  hfn - host frame number
+ */
+
+typedef unsigned long  gva_t;
+typedef u64            gpa_t;
+typedef unsigned long  gfn_t;
+
+typedef unsigned long  hva_t;
+typedef u64            hpa_t;
+typedef unsigned long  hfn_t;
 
 enum {
 	VMCB_INTERCEPTS, /* Intercept vectors, TSC offset,
@@ -104,7 +144,7 @@ struct ldttss_desc {
 	u32 zero1;
 } __attribute__((packed));
 
-struct svm_cpu_data {
+struct vmrun_cpu_data {
 	int cpu;
 	u64 asid_generation;
 	u32 max_asid;
@@ -113,12 +153,33 @@ struct svm_cpu_data {
 	struct page *save_area;
 };
 
-struct svm_vcpu {
+struct vmrun_mmu {
+	void (*new_cr3)(struct vmrun_vcpu *vcpu);
+	int (*page_fault)(struct vmrun_vcpu *vcpu, gva_t gva, u32 err);
+	void (*inval_page)(struct vmrun_vcpu *vcpu, gva_t gva);
+	void (*free)(struct vmrun_vcpu *vcpu);
+	gpa_t (*gva_to_gpa)(struct vmrun_vcpu *vcpu, gva_t gva);
+	hpa_t root_hpa;
+	int root_level;
+	int shadow_root_level;
+};
+
+struct vmrun_memory_slot {
+	gfn_t base_gfn;
+	unsigned long npages;
+	unsigned long flags;
+	struct page **phys_mem;
+	unsigned long *dirty_bitmap;
+};
+
+struct vmrun_vcpu {
+	struct vmrun *vmrun;
+	struct mutex mutex;
 	int cpu;
 	int vcpu_id;
 	struct vmcb *vmcb;
 	unsigned long vmcb_pa;
-	struct svm_cpu_data *cpu_data;
+	struct vmrun_cpu_data *cpu_data;
 	uint64_t asid_generation;
 	unsigned long cr0;
 	u32 hflags;
@@ -126,6 +187,18 @@ struct svm_vcpu {
 	u64 next_rip;
 	u32 *msrpm;
 	unsigned long regs[NR_VCPU_REGS];
+	struct vmrun_mmu mmu;
+	struct list_head free_pages;
+};
+
+struct vmrun {
+	spinlock_t lock; /* protects everything except vcpus */
+	int nmemslots;
+	struct vmrun_memory_slot memslots[VMRUN_MEMORY_SLOTS];
+	struct list_head active_mmu_pages;
+	struct vmrun_vcpu vcpus[VMRUN_MAX_VCPUS];
+	int memory_config_version;
+	int busy;
 };
 
 #endif // VMRUN_H

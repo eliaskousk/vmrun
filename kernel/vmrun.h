@@ -174,6 +174,9 @@ struct vmrun_memory_slot {
 
 struct vmrun_vcpu {
 	struct vmrun *vmrun;
+#ifdef CONFIG_PREEMPT_NOTIFIERS
+	struct preempt_notifier preempt_notifier;
+#endif
 	struct mutex mutex;
 	int cpu;
 	int vcpu_id;
@@ -185,10 +188,17 @@ struct vmrun_vcpu {
 	u32 hflags;
 	u64 efer;
 	u64 next_rip;
+	struct {
+		u16 fs;
+		u16 gs;
+		u16 ldt;
+		u64 gs_base;
+	} host;
 	u32 *msrpm;
 	unsigned long regs[NR_VCPU_REGS];
 	struct vmrun_mmu mmu;
 	struct list_head free_pages;
+	bool preempted;
 };
 
 struct vmrun {

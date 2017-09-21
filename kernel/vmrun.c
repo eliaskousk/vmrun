@@ -61,6 +61,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/cpu.h>
 #include <linux/mm.h>
 #include <linux/miscdevice.h>
 #include <linux/vmalloc.h>
@@ -78,7 +79,21 @@ static DEFINE_PER_CPU(struct vmrun_vcpu *, local_vcpu);
 static DEFINE_PER_CPU(struct vmrun_cpu_data *, cpu_data);
 static DEFINE_PER_CPU(struct vmcb *, local_vmcb);
 
+static __read_mostly struct preempt_ops vmrun_preempt_ops;
+static cpumask_var_t cpus_enabled;
 static unsigned long iopm_base;
+
+static inline u16 read_ldt(void)
+{
+	u16 ldt;
+	asm("sldt %0" : "=g"(ldt));
+	return ldt;
+}
+
+static inline void load_ldt(u16 sel)
+{
+	asm("lldt %0" : : "rm"(sel));
+}
 
 static void svm_enable(void)
 {
@@ -501,6 +516,51 @@ static void vcpu_free(struct vmrun_vcpu *vcpu)
 	kfree(vcpu);
 }
 
+static void svm_vcpu_load(struct vmrun_vcpu *vcpu, int cpu)
+{
+	if (unlikely(cpu != vcpu->cpu)) {
+		vcpu->asid_generation = 0;
+		vcpu->vmcb->control.clean = 0;
+	}
+
+	rdmsrl(MSR_GS_BASE, vcpu->host.gs_base);
+	savesegment(fs, vcpu->host.fs);
+	savesegment(gs, vcpu->host.gs);
+	vcpu->host.ldt = read_ldt();
+}
+
+static void svm_vcpu_put(struct vmrun_vcpu *vcpu)
+{
+	load_ldt(vcpu->host.ldt);
+	loadsegment(fs, vcpu->host.fs);
+	wrmsrl(MSR_KERNEL_GS_BASE, current->thread.gsbase);
+	load_gs_index(vcpu->host.gs);
+}
+
+int vcpu_load(struct vmrun_vcpu *vcpu)
+{
+	int cpu;
+
+	if (mutex_lock_killable(&vcpu->mutex))
+		return -EINTR;
+
+	cpu = get_cpu();
+	preempt_notifier_register(&vcpu->preempt_notifier);
+	svm_vcpu_load(vcpu, cpu);
+	put_cpu();
+
+	return 0;
+}
+
+void vcpu_put(struct vmrun_vcpu *vcpu)
+{
+	preempt_disable();
+	svm_vcpu_put(vcpu);
+	preempt_notifier_unregister(&vcpu->preempt_notifier);
+	preempt_enable();
+	mutex_unlock(&vcpu->mutex);
+}
+
 static int cpu_setup(int cpu)
 {
 	struct vmrun_cpu_data *cd;
@@ -521,19 +581,22 @@ static int cpu_setup(int cpu)
 
 	return 0;
 
-	err:
+err:
 	kfree(cd);
 	return r;
 }
 
 static void cpu_unsetup(int cpu)
 {
-	struct vmrun_cpu_data *cd = per_cpu(cpu_data, cpu);
+	// Called by for_each_*_cpu thus cpu = raw_smp_processor_id()
+	// and we can use either. KVM uses the latter for non-obvious reasons
+
+	struct vmrun_cpu_data *cd = per_cpu(cpu_data, raw_smp_processor_id());
 
 	if (!cd)
 		return;
 
-	per_cpu(cpu_data, cpu) = NULL;
+	per_cpu(cpu_data, raw_smp_processor_id()) = NULL;
 	__free_page(cd->save_area);
 	kfree(cd);
 
@@ -590,24 +653,23 @@ static void cpu_enable(void *unused)
 
 static void cpu_disable(void *unused)
 {
-	struct vmrun_cpu_data *cd;
-	int me = raw_smp_processor_id();
+	int cpu = raw_smp_processor_id();
 
-	cd = per_cpu(cpu_data, me);
+	if (!cpumask_test_cpu(cpu, cpus_enabled))
+		return;
+	cpumask_clear_cpu(cpu, cpus_enabled);
 
-	if (cd) {
-		// This hangs the machine, no reason why but it does!
-		//
-		// asm volatile("wrmsr\n\t" :
-		// 			    : "c" (MSR_VM_HSAVE_PA), "A" (0)
-		// 			    :);
+	// This hangs the machine, no reason why but it does!
+	//
+	// asm volatile("wrmsr\n\t" :
+	// 			    : "c" (MSR_VM_HSAVE_PA), "A" (0)
+	// 			    :);
 
-		//printk("cpu_disable: Unregistered host save area on CPU %d\n", me);
+	// printk("cpu_disable: Unregistered host save area on CPU %d\n", me);
 
-		svm_disable();
+	svm_disable();
 
-		printk("cpu_disable: Disabled SVM on CPU %d\n", me);
-	}
+	printk("cpu_disable: Disabled SVM on CPU %d\n", cpu);
 }
 
 static void svm_vcpu_create(struct vmrun_vcpu *vcpu)
@@ -1338,6 +1400,33 @@ static struct miscdevice vmrun_dev = {
 	&vmrun_chardev_ops,
 };
 
+static inline
+struct vmrun_vcpu *preempt_notifier_to_vcpu(struct preempt_notifier *pn)
+{
+	return container_of(pn, struct vmrun_vcpu, preempt_notifier);
+}
+
+static void vmrun_sched_in(struct preempt_notifier *pn, int cpu)
+{
+	struct vmrun_vcpu *vcpu = preempt_notifier_to_vcpu(pn);
+
+	if (vcpu->preempted)
+		vcpu->preempted = false;
+
+	svm_vcpu_load(vcpu, cpu);
+}
+
+static void vmrun_sched_out(struct preempt_notifier *pn,
+			  struct task_struct *next)
+{
+	struct vmrun_vcpu *vcpu = preempt_notifier_to_vcpu(pn);
+
+	if (current->state == TASK_RUNNING)
+		vcpu->preempted = true;
+
+	svm_vcpu_put(vcpu);
+}
+
 static int vmrun_init(void)
 {
 	int cpu;
@@ -1345,57 +1434,50 @@ static int vmrun_init(void)
 
 	printk("vmrun_init: Initializing AMD-V (SVM) vmrun driver\n");
 
-	if (has_svm()) {
-		printk("vmrun_init: SVM is supported and enabled on BIOS\n");
-	} else {
-		printk("vmrun_init: SVM not supported or disabled on BIOS, nothing to be done\n");
-		goto err;
+	if (!zalloc_cpumask_var(&cpus_enabled, GFP_KERNEL)) {
+		r = -ENOMEM;
+		goto out_fail;
 	}
 
 	r = iopm_allocate();
 	if (r)
-		goto err_iopm;
+		goto out_free_cpumask;
 
-	for_each_online_cpu(cpu) {
+	for_each_possible_cpu(cpu) {
 		r = cpu_setup(cpu);
 		if (r)
-			goto err;
+			goto err_free_iopm;
 	}
 
-	on_each_cpu(cpu_enable, 0, 1);
+	// Will get called with ioctl command(s)
+	// on_each_cpu(cpu_enable, 0, 1);
+
+	vmrun_chardev_ops.owner = THIS_MODULE;
 
 	r = misc_register(&vmrun_dev);
 	if (r) {
 		printk (KERN_ERR "vmrun_init: Misc device register failed\n");
-		goto err;
+		goto err_free_cpus;
 	}
+
+	vmrun_preempt_ops.sched_in = vmrun_sched_in;
+	vmrun_preempt_ops.sched_out = vmrun_sched_out;
 
 	printk("vmrun_init: Done\n");
 	
 	return r;
 
-err:
-	on_each_cpu(cpu_disable, 0, 1);
-	
-	for_each_online_cpu(cpu)
+err_free_cpus:
+	for_each_possible_cpu(cpu)
 		cpu_unsetup(cpu);
-	
-	iopm_free();
-	
 
-//	for (unsigned int i = 0; i < NR_VCPUS; i++) {
-//
-//		struct vmrun_vcpu *vcpu = vcpu_create(i);
-//		printk("vmrun_init: Created vcpu %d\n", i);
-//		vcpu_setup(vcpu);
-//		printk("vmrun_init: Setup vcpu %d\n", i);
-//		vcpu_run(vcpu);
-//		printk("vmrun_init: Run vcpu %d\n", i);
-//		vcpu_free(vcpu);
-//		printk("vmrun_init: Freed vcpu %d\n", i);
-//	}
+err_free_iopm:
+	iopm_free();
+
+out_free_cpumask:
+	free_cpumask_var(cpus_enabled);
 	
-err_iopm:
+out_fail:
 	printk("vmrun_init: Error\n");
 	return r;
 }
@@ -1404,12 +1486,16 @@ static void vmrun_exit(void)
 {
 	int cpu;
 
-	on_each_cpu(cpu_disable, 0, 1);
+	misc_deregister(&vmrun_dev);
 
-	for_each_online_cpu(cpu)
+	on_each_cpu(cpu_disable, NULL, 1);
+
+	for_each_possible_cpu(cpu)
 		cpu_unsetup(cpu);
 
 	iopm_free();
+
+	free_cpumask_var(cpus_enabled);
 
 	printk("vmrun_exit: Done\n");
 }

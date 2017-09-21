@@ -64,6 +64,7 @@
 #include <linux/cpu.h>
 #include <linux/mm.h>
 #include <linux/miscdevice.h>
+#include <linux/spinlock.h>
 #include <linux/vmalloc.h>
 #include <linux/uaccess.h>
 #include <linux/slab.h>
@@ -79,6 +80,9 @@ static DEFINE_PER_CPU(struct vmrun_vcpu *, local_vcpu);
 static DEFINE_PER_CPU(struct vmrun_cpu_data *, cpu_data);
 static DEFINE_PER_CPU(struct vmcb *, local_vmcb);
 
+static DEFINE_RAW_SPINLOCK(vmrun_count_lock);
+static int vmrun_usage_count;
+static atomic_t cpu_enable_failed;
 static __read_mostly struct preempt_ops vmrun_preempt_ops;
 static cpumask_var_t cpus_enabled;
 static unsigned long iopm_base;
@@ -559,117 +563,6 @@ void vcpu_put(struct vmrun_vcpu *vcpu)
 	preempt_notifier_unregister(&vcpu->preempt_notifier);
 	preempt_enable();
 	mutex_unlock(&vcpu->mutex);
-}
-
-static int cpu_setup(int cpu)
-{
-	struct vmrun_cpu_data *cd;
-	int r;
-
-	cd = kzalloc(sizeof(struct vmrun_cpu_data), GFP_KERNEL);
-	if (!cd)
-		return -ENOMEM;
-	cd->cpu = cpu;
-	cd->save_area = alloc_page(GFP_KERNEL);
-	r = -ENOMEM;
-	if (!cd->save_area)
-		goto err;
-
-	per_cpu(cpu_data, cpu) = cd;
-
-	printk("cpu_setup: Setup CPU %d\n", cpu);
-
-	return 0;
-
-err:
-	kfree(cd);
-	return r;
-}
-
-static void cpu_unsetup(int cpu)
-{
-	// Called by for_each_*_cpu thus cpu = raw_smp_processor_id()
-	// and we can use either. KVM uses the latter for non-obvious reasons
-
-	struct vmrun_cpu_data *cd = per_cpu(cpu_data, raw_smp_processor_id());
-
-	if (!cd)
-		return;
-
-	per_cpu(cpu_data, raw_smp_processor_id()) = NULL;
-	__free_page(cd->save_area);
-	kfree(cd);
-
-	printk("cpu_unsetup: Unsetup CPU %d\n", cpu);
-}
-
-static void cpu_enable(void *unused)
-{
-	struct vmrun_cpu_data *cd;
-	struct desc_struct *gdt;
-	int me = raw_smp_processor_id();
-
-	if (!has_svm()) {
-		printk("cpu_enable: SVM is not supported and enabled on CPU %d\n", me);
-	}
-
-	cd = per_cpu(cpu_data, me);
-
-	if (!cd) {
-		pr_err("%s: cpu_data is NULL on CPU %d\n", __func__, me);
-		return;
-	}
-
-	cd->asid_generation = 1;
-	asm volatile("cpuid\n\t" : "=b" (cd->max_asid)
-	: "a" (CPUID_EXT_A_SVM_LOCK_LEAF)
-	: "%rcx","%rdx");
-	cd->max_asid--;
-	cd->next_asid = cd->max_asid + 1;
-
-	printk("cpu_enable: Initialized ASID on CPU %d\n", me);
-
-	// Alternative to the code below for TSS desc registration
-	//
-	// struct desc_ptr gdt_descr;
-	// asm volatile("sgdt %0" : "=m" (gdt_descr));
-	// gdt = (struct desc_struct *)gdt_descr.address;
-
-	gdt = this_cpu_ptr(&gdt_page)->gdt;
-	cd->tss_desc = (struct ldttss_desc *)(gdt + GDT_ENTRY_TSS);
-
-	printk("cpu_enable: Registered TSS descriptor on CPU %d\n", me);
-
-	svm_enable();
-
-	printk("cpu_enable: Enabled SVM on CPU %d\n", me);
-
-	asm volatile("wrmsr\n\t" :
-	: "c" (MSR_VM_HSAVE_PA), "A" (page_to_pfn(cd->save_area) << PAGE_SHIFT)
-	:);
-
-	printk("cpu_setup: Registered host save area on CPU %d\n", me);
-}
-
-static void cpu_disable(void *unused)
-{
-	int cpu = raw_smp_processor_id();
-
-	if (!cpumask_test_cpu(cpu, cpus_enabled))
-		return;
-	cpumask_clear_cpu(cpu, cpus_enabled);
-
-	// This hangs the machine, no reason why but it does!
-	//
-	// asm volatile("wrmsr\n\t" :
-	// 			    : "c" (MSR_VM_HSAVE_PA), "A" (0)
-	// 			    :);
-
-	// printk("cpu_disable: Unregistered host save area on CPU %d\n", me);
-
-	svm_disable();
-
-	printk("cpu_disable: Disabled SVM on CPU %d\n", cpu);
 }
 
 static void svm_vcpu_create(struct vmrun_vcpu *vcpu)
@@ -1355,43 +1248,44 @@ out:
 	return r;
 }
 
-static struct page *vmrun_dev_nopage(struct vm_area_struct *vma,
-				   unsigned long address,
-				   int *type)
-{
-	struct vmrun *vmrun = vma->vm_file->private_data;
-	unsigned long pgoff;
-	struct vmrun_memory_slot *slot;
-	struct page *page;
-
-	*type = VM_FAULT_MINOR;
-	pgoff = ((address - vma->vm_start) >> PAGE_SHIFT) + vma->vm_pgoff;
-	slot = gfn_to_memslot(vmrun, pgoff);
-	if (!slot)
-		return NOPAGE_SIGBUS;
-	page = gfn_to_page(slot, pgoff);
-	if (!page)
-		return NOPAGE_SIGBUS;
-	get_page(page);
-	return page;
-}
-
-static struct vm_operations_struct vmrun_dev_vm_ops = {
-	.nopage = vmrun_dev_nopage,
-};
-
-static int vmrun_dev_mmap(struct file *file, struct vm_area_struct *vma)
-{
-	vma->vm_ops = &vmrun_dev_vm_ops;
-	return 0;
-}
+//static struct page *vmrun_dev_nopage(struct vm_area_struct *vma,
+//				   unsigned long address,
+//				   int *type)
+//{
+//	struct vmrun *vmrun = vma->vm_file->private_data;
+//	unsigned long pgoff;
+//	struct vmrun_memory_slot *slot;
+//	struct page *page;
+//
+//	*type = VM_FAULT_MINOR;
+//	pgoff = ((address - vma->vm_start) >> PAGE_SHIFT) + vma->vm_pgoff;
+//	slot = gfn_to_memslot(vmrun, pgoff);
+//	if (!slot)
+//		return NOPAGE_SIGBUS;
+//	page = gfn_to_page(slot, pgoff);
+//	if (!page)
+//		return NOPAGE_SIGBUS;
+//	get_page(page);
+//	return page;
+//}
+//
+//static struct vm_operations_struct vmrun_dev_vm_ops = {
+//	.nopage = vmrun_dev_nopage,
+//};
+//
+//static int vmrun_dev_mmap(struct file *file, struct vm_area_struct *vma)
+//{
+//	vma->vm_ops = &vmrun_dev_vm_ops;
+//	return 0;
+//}
 
 static struct file_operations vmrun_chardev_ops = {
 	.open		= vmrun_dev_open,
 	.release        = vmrun_dev_release,
 	.unlocked_ioctl = vmrun_dev_ioctl,
 	.compat_ioctl   = vmrun_dev_ioctl,
-	.mmap           = vmrun_dev_mmap,
+	.llseek		= noop_llseek,
+	//.mmap           = vmrun_dev_mmap,
 };
 
 static struct miscdevice vmrun_dev = {
@@ -1427,6 +1321,180 @@ static void vmrun_sched_out(struct preempt_notifier *pn,
 	svm_vcpu_put(vcpu);
 }
 
+static int cpu_enable()
+{
+	struct vmrun_cpu_data *cd;
+	struct desc_struct *gdt;
+	int me = raw_smp_processor_id();
+	uint64_t efer;
+
+	// TODO: Move the check to a function
+	rdmsrl(MSR_EFER, efer);
+	if (efer & EFER_SVME)
+		return -EBUSY;
+
+	if (!has_svm()) {
+		printk("cpu_enable: SVM is not supported and enabled on CPU %d\n", me);
+		return -EINVAL;
+	}
+
+	cd = per_cpu(cpu_data, me);
+
+	if (!cd) {
+		pr_err("%s: cpu_data is NULL on CPU %d\n", __func__, me);
+		return -EINVAL;
+	}
+
+	cd->asid_generation = 1;
+	asm volatile("cpuid\n\t" : "=b" (cd->max_asid)
+	: "a" (CPUID_EXT_A_SVM_LOCK_LEAF)
+	: "%rcx","%rdx");
+	cd->max_asid--;
+	cd->next_asid = cd->max_asid + 1;
+
+	printk("cpu_enable: Initialized ASID on CPU %d\n", me);
+
+	// Alternative to the code below for TSS desc registration
+	//
+	// struct desc_ptr gdt_descr;
+	// asm volatile("sgdt %0" : "=m" (gdt_descr));
+	// gdt = (struct desc_struct *)gdt_descr.address;
+
+	gdt = this_cpu_ptr(&gdt_page)->gdt;
+	cd->tss_desc = (struct ldttss_desc *)(gdt + GDT_ENTRY_TSS);
+
+	printk("cpu_enable: Registered TSS descriptor on CPU %d\n", me);
+
+	svm_enable();
+
+	printk("cpu_enable: Enabled SVM on CPU %d\n", me);
+
+	asm volatile("wrmsr\n\t" :
+	: "c" (MSR_VM_HSAVE_PA), "A" (page_to_pfn(cd->save_area) << PAGE_SHIFT)
+	:);
+
+	printk("cpu_setup: Registered host save area on CPU %d\n", me);
+}
+
+static void cpu_enable_nolock(void *junk)
+{
+	int cpu = raw_smp_processor_id();
+	int r;
+
+	if (cpumask_test_cpu(cpu, cpus_enabled))
+		return;
+
+	cpumask_set_cpu(cpu, cpus_enabled);
+
+	r = cpu_enable();
+
+	if (r) {
+		cpumask_clear_cpu(cpu, cpus_enabled);
+		atomic_inc(&cpu_enable_failed);
+		pr_info("cpu_enable_nolock: enabling virtualization on CPU %d failed\n", cpu);
+	}
+}
+
+static int vmrun_cpu_enable(unsigned int cpu)
+{
+	raw_spin_lock(&vmrun_count_lock);
+
+	if (vmrun_usage_count)
+		cpu_enable_nolock(NULL);
+
+	raw_spin_unlock(&vmrun_count_lock);
+
+	return 0;
+}
+
+static void cpu_disable()
+{
+	int cpu = raw_smp_processor_id();
+
+	if (!cpumask_test_cpu(cpu, cpus_enabled))
+		return;
+	cpumask_clear_cpu(cpu, cpus_enabled);
+
+	// This hangs the machine, no reason why but it does!
+	// TODO: Retest with new changes
+	//
+	// asm volatile("wrmsr\n\t" :
+	// 			    : "c" (MSR_VM_HSAVE_PA), "A" (0)
+	// 			    :);
+
+	// printk("cpu_disable: Unregistered host save area on CPU %d\n", me);
+
+	svm_disable();
+
+	printk("cpu_disable: Disabled SVM on CPU %d\n", cpu);
+}
+
+static void cpu_disable_nolock(void *junk)
+{
+	int cpu = raw_smp_processor_id();
+
+	if (!cpumask_test_cpu(cpu, cpus_enabled))
+		return;
+
+	cpumask_clear_cpu(cpu, cpus_enabled);
+
+	cpu_disable();
+}
+
+static int vmrun_cpu_disable(unsigned int cpu)
+{
+	raw_spin_lock(&vmrun_count_lock);
+
+	if (vmrun_usage_count)
+		cpu_disable_nolock(NULL);
+
+	raw_spin_unlock(&vmrun_count_lock);
+
+	return 0;
+}
+
+static int vmrun_cpu_setup(int cpu)
+{
+	struct vmrun_cpu_data *cd;
+	int r;
+
+	cd = kzalloc(sizeof(struct vmrun_cpu_data), GFP_KERNEL);
+	if (!cd)
+		return -ENOMEM;
+	cd->cpu = cpu;
+	cd->save_area = alloc_page(GFP_KERNEL);
+	r = -ENOMEM;
+	if (!cd->save_area)
+		goto err;
+
+	per_cpu(cpu_data, cpu) = cd;
+
+	printk("cpu_setup: Setup CPU %d\n", cpu);
+
+	return 0;
+
+	err:
+	kfree(cd);
+	return r;
+}
+
+static void vmrun_cpu_unsetup(int cpu)
+{
+	// Called by for_each_*_cpu thus cpu = raw_smp_processor_id()
+	// and we can use either. KVM uses the latter for non-obvious reasons
+
+	struct vmrun_cpu_data *cd = per_cpu(cpu_data, raw_smp_processor_id());
+
+	if (!cd)
+		return;
+
+	per_cpu(cpu_data, raw_smp_processor_id()) = NULL;
+	__free_page(cd->save_area);
+	kfree(cd);
+
+	printk("cpu_unsetup: Unsetup CPU %d\n", cpu);
+}
+
 static int vmrun_init(void)
 {
 	int cpu;
@@ -1444,20 +1512,22 @@ static int vmrun_init(void)
 		goto out_free_cpumask;
 
 	for_each_possible_cpu(cpu) {
-		r = cpu_setup(cpu);
+		r = vmrun_cpu_setup(cpu);
 		if (r)
-			goto err_free_iopm;
+			goto out_free_iopm;
 	}
 
-	// Will get called with ioctl command(s)
-	// on_each_cpu(cpu_enable, 0, 1);
+	r = cpuhp_setup_state_nocalls(CPUHP_AP_KVM_STARTING, "vmrun/cpu:starting",
+				      vmrun_cpu_enable, vmrun_cpu_disable);
+	if (r)
+		goto out_free_cpus;
 
 	vmrun_chardev_ops.owner = THIS_MODULE;
 
 	r = misc_register(&vmrun_dev);
 	if (r) {
 		printk (KERN_ERR "vmrun_init: Misc device register failed\n");
-		goto err_free_cpus;
+		goto out_free_hp;
 	}
 
 	vmrun_preempt_ops.sched_in = vmrun_sched_in;
@@ -1467,11 +1537,14 @@ static int vmrun_init(void)
 	
 	return r;
 
-err_free_cpus:
-	for_each_possible_cpu(cpu)
-		cpu_unsetup(cpu);
+out_free_hp:
+	cpuhp_remove_state_nocalls(CPUHP_AP_KVM_STARTING);
 
-err_free_iopm:
+out_free_cpus:
+	for_each_possible_cpu(cpu)
+		vmrun_cpu_unsetup(cpu);
+
+out_free_iopm:
 	iopm_free();
 
 out_free_cpumask:
@@ -1488,10 +1561,12 @@ static void vmrun_exit(void)
 
 	misc_deregister(&vmrun_dev);
 
-	on_each_cpu(cpu_disable, NULL, 1);
+	cpuhp_remove_state_nocalls(CPUHP_AP_KVM_STARTING);
+
+	on_each_cpu(cpu_disable_nolock, NULL, 1);
 
 	for_each_possible_cpu(cpu)
-		cpu_unsetup(cpu);
+		vmrun_cpu_unsetup(cpu);
 
 	iopm_free();
 

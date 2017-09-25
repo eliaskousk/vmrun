@@ -156,7 +156,7 @@ exit_vmrun:
 	return 0;
 }
 
-void load_binary(struct vmrun *vmrun)
+void vmrun_load_binary(struct vmrun *vmrun)
 {
 	int fd = open(GUEST_BINARY, O_RDONLY);
 	
@@ -317,7 +317,7 @@ int main(int argc, char **argv)
 		return -1;
 	}
 
-	load_binary(vmrun);
+	vmrun_load_binary(vmrun);
 
 	// We only support one vcpu
 	vmrun->vcpu_number = 1;

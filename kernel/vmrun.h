@@ -42,6 +42,12 @@
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
+#include <linux/sched.h>
+#include <linux/bug.h>
+#include <linux/mm.h>
+#include <linux/mmu_notifier.h>
+#include <linux/preempt.h>
+#include <linux/refcount.h>
 
 #define CPUID_EXT_1_SVM_LEAF      0x80000001
 #define CPUID_EXT_1_SVM_BIT       0x2
@@ -65,8 +71,23 @@
 
 #define INVALID_PAGE              (~(hpa_t)0)
 
-#define VMRUN_MAX_VCPUS           1
-#define VMRUN_MEMORY_SLOTS        4
+#define VMRUN_MAX_VCPUS		288
+#define VMRUN_SOFT_MAX_VCPUS	240
+#define VMRUN_MAX_VCPU_ID	1023
+#define VMRUN_USER_MEM_SLOTS	509
+#define VMRUN_PRIVATE_MEM_SLOTS	3 /* memory slots that are not exposed to userspace */
+#define VMRUN_MEM_SLOTS_NUM	(VMRUN_USER_MEM_SLOTS + VMRUN_PRIVATE_MEM_SLOTS)
+#define VMRUN_NR_PAGE_SIZES	3
+#define VMRUN_ADDRESS_SPACE_NUM	2
+
+#define VMRUN_REQUEST_MASK	GENMASK(7,0)
+#define VMRUN_REQUEST_NO_WAKEUP	BIT(8)
+#define VMRUN_REQUEST_WAIT	BIT(9)
+/*
+ * Architecture-independent vcpu->requests bit members
+ * Bits 4-7 are reserved for more arch-independent bits.
+ */
+#define VMRUN_REQ_TLB_FLUSH         (0 | VMRUN_REQUEST_WAIT | VMRUN_REQUEST_NO_WAKEUP)
 
 #define INSTR_SVM_VMRUN           ".byte 0x0f, 0x01, 0xd8"
 #define INSTR_SVM_VMMCALL         ".byte 0x0f, 0x01, 0xd9"
@@ -88,11 +109,18 @@
 
 typedef unsigned long  gva_t;
 typedef u64            gpa_t;
-typedef unsigned long  gfn_t;
+typedef u64            gfn_t;
 
 typedef unsigned long  hva_t;
 typedef u64            hpa_t;
-typedef unsigned long  hfn_t;
+typedef u64            hfn_t;
+
+typedef hfn_t          vmrun_pfn_t;
+
+enum vmrun_page_track_mode {
+	VMRUN_PAGE_TRACK_WRITE,
+	VMRUN_PAGE_TRACK_MAX,
+};
 
 enum {
 	VMCB_INTERCEPTS, /* Intercept vectors, TSC offset,
@@ -135,6 +163,11 @@ enum reg {
 	NR_VCPU_REGS
 };
 
+struct system_table {
+	u16 limit;
+	u64 base;
+} __attribute__ ((__packed__));
+
 struct ldttss_desc {
 	u16 limit0;
 	u16 base0;
@@ -164,22 +197,20 @@ struct vmrun_mmu {
 	int shadow_root_level;
 };
 
-struct vmrun_memory_slot {
-	gfn_t base_gfn;
-	unsigned long npages;
-	unsigned long flags;
-	struct page **phys_mem;
-	unsigned long *dirty_bitmap;
-};
-
 struct vmrun_vcpu {
 	struct vmrun *vmrun;
-#ifdef CONFIG_PREEMPT_NOTIFIERS
 	struct preempt_notifier preempt_notifier;
-#endif
-	struct mutex mutex;
 	int cpu;
 	int vcpu_id;
+	int srcu_idx;
+	int mode;
+	unsigned long requests;
+	struct list_head blocked_vcpu_list;
+	struct mutex mutex;
+	struct kvm_run *run;
+	struct pid __rcu *pid;
+
+	// SVM (Some are old)
 	struct vmcb *vmcb;
 	unsigned long vmcb_pa;
 	struct vmrun_cpu_data *cpu_data;
@@ -201,14 +232,80 @@ struct vmrun_vcpu {
 	bool preempted;
 };
 
-struct vmrun {
-	spinlock_t lock; /* protects everything except vcpus */
-	int nmemslots;
-	struct vmrun_memory_slot memslots[VMRUN_MEMORY_SLOTS];
-	struct list_head active_mmu_pages;
-	struct vmrun_vcpu vcpus[VMRUN_MAX_VCPUS];
-	int memory_config_version;
-	int busy;
+struct vmrun_rmap_head {
+	unsigned long val;
 };
+
+struct vmrun_lpage_info {
+	int disallow_lpage;
+};
+
+struct vmrun_arch_memory_slot {
+	struct vmrun_rmap_head *rmap[VMRUN_NR_PAGE_SIZES];
+	struct vmrun_lpage_info *lpage_info[VMRUN_NR_PAGE_SIZES - 1];
+	unsigned short *gfn_track[VMRUN_PAGE_TRACK_MAX];
+};
+
+struct vmrun_memory_slot {
+	gfn_t base_gfn;
+	unsigned long npages;
+	unsigned long *dirty_bitmap;
+	struct vmrun_arch_memory_slot arch;
+	unsigned long userspace_addr;
+	u32 flags;
+	short id;
+};
+
+struct vmrun_memslots {
+	u64 generation;
+	struct vmrun_memory_slot memslots[VMRUN_MEM_SLOTS_NUM];
+	/* The mapping table from slot id to the index in memslots[]. */
+	short id_to_index[VMRUN_MEM_SLOTS_NUM];
+	atomic_t lru_slot;
+	int used_slots;
+};
+
+struct vmrun {
+	spinlock_t mmu_lock;
+	struct mutex slots_lock;
+	struct mm_struct *mm; /* userspace tied to this vm */
+	struct vmrun_memslots __rcu *memslots[VMRUN_ADDRESS_SPACE_NUM];
+	struct vmrun_vcpu *vcpus[VMRUN_MAX_VCPUS];
+
+	/*
+	 * created_vcpus is protected by vmrun->lock, and is incremented
+	 * at the beginning of VMRUN_CREATE_VCPU.  online_vcpus is only
+	 * incremented after storing the vmrun_vcpu pointer in vcpus,
+	 * and is accessed atomically.
+	 */
+
+	atomic_t online_vcpus;
+	int created_vcpus;
+	int last_boosted_vcpu;
+	struct list_head vm_list;
+	struct mutex lock;
+	refcount_t users_count;
+
+	struct mmu_notifier mmu_notifier;
+	unsigned long mmu_notifier_seq;
+	long mmu_notifier_count;
+
+	long tlbs_dirty;
+	struct srcu_struct srcu;
+	struct list_head active_mmu_pages;
+	struct list_head zapped_obsolete_pages;
+	struct list_head assigned_dev_head;
+	atomic_t noncoherent_dma_count;
+	struct hlist_head mask_notifier_list; /* reads protected by irq_srcu, writes by irq_lock */
+};
+
+void vmrun_mmu_init_vm(struct vmrun *vmrun);
+void vmrun_mmu_uninit_vm(struct vmrun *kvm);
+void vmrun_mmu_destroy(struct vmrun_vcpu *vcpu);
+void vmrun_mmu_unload(struct vmrun_vcpu *vcpu);
+int vmrun_unmap_hva_range(struct vmrun *vmrun, unsigned long start, unsigned long end);
+int vmrun_age_hva(struct vmrun *vmrun, unsigned long start, unsigned long end);
+int vmrun_test_age_hva(struct vmrun *vmrun, unsigned long hva);
+void vmrun_set_spte_hva(struct vmrun *vmrun, unsigned long hva, pte_t pte);
 
 #endif // VMRUN_H

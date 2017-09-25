@@ -179,4 +179,13 @@ struct vmrun_memory_region {
 	__u64 memory_size; /* bytes */
 };
 
+/* for VMRUN_SET_USER_MEMORY_REGION */
+struct vmrun_userspace_memory_region {
+	__u32 slot;
+	__u32 flags;
+	__u64 guest_phys_addr;
+	__u64 memory_size; /* bytes */
+	__u64 userspace_addr; /* start of the userspace allocated memory */
+};
+
 #endif /* VMRUN_USER */

@@ -1405,7 +1405,7 @@ static int vmrun_vm_ioctl_set_memory_region(struct vmrun *vmrun,
 }
 
 static long vmrun_vm_ioctl(struct file *filp,
-			 unsigned int ioctl, unsigned long arg)
+			   unsigned int ioctl, unsigned long arg)
 {
 	struct vmrun *vmrun = filp->private_data;
 	void __user *argp   = (void __user *)arg;
@@ -1421,8 +1421,8 @@ static long vmrun_vm_ioctl(struct file *filp,
 
 		case VMRUN_SET_USER_MEMORY_REGION: {
 			struct vmrun_userspace_memory_region vmrun_userspace_mem;
-
 			r = -EFAULT;
+
 			if (copy_from_user(&vmrun_userspace_mem,
 					   argp,
 					   sizeof(vmrun_userspace_mem)))

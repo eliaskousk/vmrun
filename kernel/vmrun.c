@@ -92,7 +92,7 @@ static cpumask_var_t cpus_enabled;
 static int vmrun_usage_count;
 static atomic_t cpu_enable_failed;
 
-struct kmem_cache *kvm_vcpu_cache;
+struct kmem_cache *vmrun_vcpu_cache;
 
 static __read_mostly struct preempt_ops vmrun_preempt_ops;
 
@@ -160,7 +160,7 @@ static int vmrun_svm_check(void)
 	return (msr_efer_value & (1 << MSR_EFER_SVM_EN_BIT));
 }
 
-static int vmrun_has_svm (void)
+static int vmrun_has_svm(void)
 {
 	int cpuid_leaf      = 0;
 	int cpuid_value     = 0;
@@ -589,6 +589,21 @@ void vmrun_vcpu_put(struct vmrun_vcpu *vcpu)
 	mutex_unlock(&vcpu->mutex);
 }
 
+bool vmrun_vcpu_wake_up(struct vmrun_vcpu *vcpu)
+{
+	struct swait_queue_head *wqp;
+
+	wqp = vmrun_arch_vcpu_wq(vcpu);
+
+	if (swq_has_sleeper(wqp)) {
+		swake_up(wqp);
+		++vcpu->stat.halt_wakeup;
+		return true;
+	}
+
+	return false;
+}
+
 static void vmrun_svm_vcpu_create(struct vmrun_vcpu *vcpu)
 {
 	struct page *vmcb_page;
@@ -716,7 +731,7 @@ static void vmrun_svm_free_vcpu(struct vmrun_vcpu *vcpu)
 	//__free_pages(virt_to_page(vcpu->msrpm), MSRPM_ALLOC_ORDER);
 
 	vmrun_vcpu_uninit(vcpu);
-	kmem_cache_free(kvm_vcpu_cache, vcpu);
+	kmem_cache_free(vmrun_vcpu_cache, vcpu);
 }
 
 static void vmrun_free_vcpus(struct vmrun *vmrun)
@@ -745,47 +760,80 @@ static void vmrun_free_vcpus(struct vmrun *vmrun)
 	mutex_unlock(&vmrun->lock);
 }
 
-
-static int vmrun_dev_ioctl_vcpu_create(struct vmrun *vmrun, int n) {
+/*
+ * Creates some virtual cpus.  Good luck creating more than one.
+ */
+static int vmrun_vm_ioctl_create_vcpu(struct vmrun *vmrun, u32 id)
+{
 	int r;
 	struct vmrun_vcpu *vcpu;
 
-	r = -EINVAL;
-	if (n < 0 || n >= VMRUN_MAX_VCPUS)
-		goto out;
+	if (id >= VMRUN_MAX_VCPU_ID)
+		return -EINVAL;
 
-	vcpu = &vmrun->vcpus[n];
-
-	mutex_lock(&vcpu->mutex);
-
-	if (vcpu->vmcb) {
-		mutex_unlock(&vcpu->mutex);
-		return -EEXIST;
+	mutex_lock(&vmrun->lock);
+	if (vmrun->created_vcpus == VMRUN_MAX_VCPUS) {
+		mutex_unlock(&vmrun->lock);
+		return -EINVAL;
 	}
 
-	vcpu->cpu = -1;  /* First load will set up TR */
-	vcpu->vmrun = vmrun;
-	r = vmrun_svm_vcpu_create(vcpu);
-	if (r < 0)
-		goto out_free_vcpus;
+	vmrun->created_vcpus++;
+	mutex_unlock(&vmrun->lock);
 
-	vmrun_vcpu_load(vcpu);
+	vcpu = vmrun_arch_vcpu_create(vmrun, id);
+	if (IS_ERR(vcpu)) {
+		r = PTR_ERR(vcpu);
+		goto vcpu_decrement;
+	}
 
-	r = vmrun_vcpu_setup(vcpu);
-	if (r >= 0)
-		r = vmrun_mmu_init(vcpu);
+	preempt_notifier_init(&vcpu->preempt_notifier, &vmrun_preempt_ops);
 
-	vmrun_vcpu_put(vcpu);
+	r = vmrun_arch_vcpu_setup(vcpu);
+	if (r)
+		goto vcpu_destroy;
 
-	if (r < 0)
-		goto out_free_vcpus;
+	r = vmrun_create_vcpu_debugfs(vcpu);
+	if (r)
+		goto vcpu_destroy;
 
-	return 0;
+	mutex_lock(&vmrun->lock);
+	if (vmrun_get_vcpu_by_id(vmrun, id)) {
+		r = -EEXIST;
+		goto unlock_vcpu_destroy;
+	}
 
-	out_free_vcpus:
-	vmrun_free_vcpu(vcpu);
-	mutex_unlock(&vcpu->mutex);
-	out:
+	BUG_ON(vmrun->vcpus[atomic_read(&vmrun->online_vcpus)]);
+
+	/* Now it's all set up, let userspace reach it */
+	vmrun_get_vmrun(vmrun);
+	r = create_vcpu_fd(vcpu);
+	if (r < 0) {
+		vmrun_put_vmrun(vmrun);
+		goto unlock_vcpu_destroy;
+	}
+
+	vmrun->vcpus[atomic_read(&vmrun->online_vcpus)] = vcpu;
+
+	/*
+	 * Pairs with smp_rmb() in vmrun_get_vcpu.  Write vmrun->vcpus
+	 * before vmrun->online_vcpu's incremented value.
+	 */
+	smp_wmb();
+	atomic_inc(&vmrun->online_vcpus);
+
+	mutex_unlock(&vmrun->lock);
+	vmrun_arch_vcpu_postcreate(vcpu);
+	return r;
+
+	unlock_vcpu_destroy:
+	mutex_unlock(&vmrun->lock);
+	debugfs_remove_recursive(vcpu->debugfs_dentry);
+	vcpu_destroy:
+	vmrun_arch_vcpu_destroy(vcpu);
+	vcpu_decrement:
+	mutex_lock(&vmrun->lock);
+	vmrun->created_vcpus--;
+	mutex_unlock(&vmrun->lock);
 	return r;
 }
 
@@ -1027,163 +1075,6 @@ static int vmrun_dev_ioctl_set_sregs(struct vmrun *vmrun, struct vmrun_sregs *sr
 	return 0;
 }
 
-/*
- * Allocate some memory and give it an address in the guest physical address
- * space.
- *
- * Discontiguous memory is allowed, mostly for framebuffers.
- */
-static int vmrun_dev_ioctl_set_memory_region(struct vmrun *vmrun,
-					     struct vmrun_memory_region *mem)
-{
-	int r;
-	gfn_t base_gfn;
-	unsigned long npages;
-	unsigned long i;
-	struct vmrun_memory_slot *memslot;
-	struct vmrun_memory_slot old, new;
-	int memory_config_version;
-
-	r = -EINVAL;
-
-	/* General sanity checks */
-	if (mem->memory_size & (PAGE_SIZE - 1))
-		goto out;
-
-	if (mem->guest_phys_addr & (PAGE_SIZE - 1))
-		goto out;
-
-	if (mem->slot >= VMRUN_MEMORY_SLOTS)
-		goto out;
-
-	if (mem->guest_phys_addr + mem->memory_size < mem->guest_phys_addr)
-		goto out;
-
-	memslot  = &vmrun->memslots[mem->slot];
-	base_gfn = mem->guest_phys_addr >> PAGE_SHIFT;
-	npages   = mem->memory_size >> PAGE_SHIFT;
-
-	if (!npages)
-		mem->flags &= ~VMRUN_MEM_LOG_DIRTY_PAGES;
-
-raced:
-	spin_lock(&vmrun->lock);
-
-	memory_config_version = vmrun->memory_config_version;
-	new = old = *memslot;
-
-	new.base_gfn = base_gfn;
-	new.npages = npages;
-	new.flags = mem->flags;
-
-	/* Disallow changing a memory slot's size. */
-	r = -EINVAL;
-	if (npages && old.npages && npages != old.npages)
-		goto out_unlock;
-
-	/* Check for overlaps */
-	r = -EEXIST;
-	for (i = 0; i < VMRUN_MEMORY_SLOTS; ++i) {
-		struct vmrun_memory_slot *s = &vmrun->memslots[i];
-
-		if (s == memslot)
-			continue;
-		if (!((base_gfn + npages <= s->base_gfn) ||
-		      (base_gfn >= s->base_gfn + s->npages)))
-			goto out_unlock;
-	}
-
-	/*
-	 * Do memory allocations outside lock.  memory_config_version will
-	 * detect any races.
-	 */
-	spin_unlock(&vmrun->lock);
-
-	/* Deallocate if slot is being removed */
-	if (!npages)
-		new.phys_mem = 0;
-
-	/* Free page dirty bitmap if unneeded */
-	if (!(new.flags & VMRUN_MEM_LOG_DIRTY_PAGES))
-		new.dirty_bitmap = 0;
-
-	r = -ENOMEM;
-
-	/* Allocate if a slot is being created */
-	if (npages && !new.phys_mem) {
-		new.phys_mem = vmalloc(npages * sizeof(struct page *));
-
-		if (!new.phys_mem)
-			goto out_free;
-
-		memset(new.phys_mem, 0, npages * sizeof(struct page *));
-
-		for (i = 0; i < npages; ++i) {
-			new.phys_mem[i] = alloc_page(GFP_HIGHUSER
-						     | __GFP_ZERO);
-
-			if (!new.phys_mem[i])
-				goto out_free;
-		}
-	}
-
-	/* Allocate page dirty bitmap if needed */
-	if ((new.flags & VMRUN_MEM_LOG_DIRTY_PAGES) && !new.dirty_bitmap) {
-		unsigned dirty_bytes = ALIGN(npages, BITS_PER_LONG) / 8;
-
-		new.dirty_bitmap = vmalloc(dirty_bytes);
-
-		if (!new.dirty_bitmap)
-			goto out_free;
-
-		memset(new.dirty_bitmap, 0, dirty_bytes);
-	}
-
-	spin_lock(&vmrun->lock);
-
-	if (memory_config_version != vmrun->memory_config_version) {
-		spin_unlock(&vmrun->lock);
-		vmrun_free_physmem_slot(&new, &old);
-		goto raced;
-	}
-
-	r = -EAGAIN;
-	if (vmrun->busy)
-		goto out_unlock;
-
-	if (mem->slot >= vmrun->nmemslots)
-		vmrun->nmemslots = mem->slot + 1;
-
-	*memslot = new;
-	++vmrun->memory_config_version;
-
-	spin_unlock(&vmrun->lock);
-
-	for (i = 0; i < VMRUN_MAX_VCPUS; ++i) {
-		struct vmrun_vcpu *vcpu;
-
-		vcpu = vcpu_load(vmrun, i);
-
-		if (!vcpu)
-			continue;
-		vmrun_mmu_reset_context(vcpu);
-
-		vcpu_put(vcpu);
-	}
-
-	vmrun_free_physmem_slot(&old, &new);
-	return 0;
-
-out_unlock:
-	spin_unlock(&vmrun->lock);
-
-out_free:
-	vmrun_free_physmem_slot(&new, &old);
-
-out:
-	return r;
-}
-
 //static int vmrun_dev_open(struct inode *inode, struct file *filp)
 //{
 //	struct vmrun *vmrun = kzalloc(sizeof(struct vmrun), GFP_KERNEL);
@@ -1219,186 +1110,333 @@ out:
 //	return 0;
 //}
 
-bool vmrun_vcpu_wake_up(struct vmrun_vcpu *vcpu)
+/*
+ * Insert memslot and re-sort memslots based on their GFN,
+ * so binary search could be used to lookup GFN.
+ * Sorting algorithm takes advantage of having initially
+ * sorted array and known changed memslot position.
+ */
+static void update_memslots(struct vmrun_memslots *slots,
+			    struct vmrun_memory_slot *new)
 {
-	struct swait_queue_head *wqp;
+	int id = new->id;
+	int i = slots->id_to_index[id];
+	struct vmrun_memory_slot *mslots = slots->memslots;
 
-	wqp = vmrun_arch_vcpu_wq(vcpu);
-
-	if (swq_has_sleeper(wqp)) {
-		swake_up(wqp);
-		++vcpu->stat.halt_wakeup;
-		return true;
+	WARN_ON(mslots[i].id != id);
+	if (!new->npages) {
+		WARN_ON(!mslots[i].npages);
+		if (mslots[i].npages)
+			slots->used_slots--;
+	} else {
+		if (!mslots[i].npages)
+			slots->used_slots++;
 	}
 
-	return false;
+	while (i < VMRUN_MEM_SLOTS_NUM - 1 &&
+	       new->base_gfn <= mslots[i + 1].base_gfn) {
+		if (!mslots[i + 1].npages)
+			break;
+		mslots[i] = mslots[i + 1];
+		slots->id_to_index[mslots[i].id] = i;
+		i++;
+	}
+
+	/*
+	 * The ">=" is needed when creating a slot with base_gfn == 0,
+	 * so that it moves before all those with base_gfn == npages == 0.
+	 *
+	 * On the other hand, if new->npages is zero, the above loop has
+	 * already left i pointing to the beginning of the empty part of
+	 * mslots, and the ">=" would move the hole backwards in this
+	 * case---which is wrong.  So skip the loop when deleting a slot.
+	 */
+	if (new->npages) {
+		while (i > 0 &&
+		       new->base_gfn >= mslots[i - 1].base_gfn) {
+			mslots[i] = mslots[i - 1];
+			slots->id_to_index[mslots[i].id] = i;
+			i--;
+		}
+	} else
+		WARN_ON_ONCE(i != slots->used_slots);
+
+	mslots[i] = *new;
+	slots->id_to_index[mslots[i].id] = i;
+}
+
+static int check_memory_region_flags(const struct vmrun_userspace_memory_region *mem)
+{
+	u32 valid_flags = VMRUN_MEM_LOG_DIRTY_PAGES;
+
+#ifdef __VMRUN_HAVE_READONLY_MEM
+	valid_flags |= VMRUN_MEM_READONLY;
+#endif
+
+	if (mem->flags & ~valid_flags)
+		return -EINVAL;
+
+	return 0;
+}
+
+static struct vmrun_memslots *install_new_memslots(struct vmrun *vmrun,
+						 int as_id, struct vmrun_memslots *slots)
+{
+	struct vmrun_memslots *old_memslots = __vmrun_memslots(vmrun, as_id);
+
+	/*
+	 * Set the low bit in the generation, which disables SPTE caching
+	 * until the end of synchronize_srcu_expedited.
+	 */
+	WARN_ON(old_memslots->generation & 1);
+	slots->generation = old_memslots->generation + 1;
+
+	rcu_assign_pointer(vmrun->memslots[as_id], slots);
+	synchronize_srcu_expedited(&vmrun->srcu);
+
+	/*
+	 * Increment the new memslot generation a second time. This prevents
+	 * vm exits that race with memslot updates from caching a memslot
+	 * generation that will (potentially) be valid forever.
+	 *
+	 * Generations must be unique even across address spaces.  We do not need
+	 * a global counter for that, instead the generation space is evenly split
+	 * across address spaces.  For example, with two address spaces, address
+	 * space 0 will use generations 0, 4, 8, ... while * address space 1 will
+	 * use generations 2, 6, 10, 14, ...
+	 */
+	slots->generation += VMRUN_ADDRESS_SPACE_NUM * 2 - 1;
+
+	vmrun_arch_memslots_updated(vmrun, slots);
+
+	return old_memslots;
+}
+
+/*
+ * Allocate some memory and give it an address in the guest physical address
+ * space.
+ *
+ * Discontiguous memory is allowed, mostly for framebuffers.
+ *
+ * Must be called holding vmrun->slots_lock for write.
+ */
+int __vmrun_set_memory_region(struct vmrun *vmrun,
+			    const struct vmrun_userspace_memory_region *mem)
+{
+	int r;
+	gfn_t base_gfn;
+	unsigned long npages;
+	struct vmrun_memory_slot *slot;
+	struct vmrun_memory_slot old, new;
+	struct vmrun_memslots *slots = NULL, *old_memslots;
+	int as_id, id;
+	enum vmrun_mr_change change;
+
+	r = check_memory_region_flags(mem);
+	if (r)
+		goto out;
+
+	r = -EINVAL;
+	as_id = mem->slot >> 16;
+	id = (u16)mem->slot;
+
+	/* General sanity checks */
+	if (mem->memory_size & (PAGE_SIZE - 1))
+		goto out;
+	if (mem->guest_phys_addr & (PAGE_SIZE - 1))
+		goto out;
+	/* We can read the guest memory with __xxx_user() later on. */
+	if ((id < VMRUN_USER_MEM_SLOTS) &&
+	    ((mem->userspace_addr & (PAGE_SIZE - 1)) ||
+	     !access_ok(VERIFY_WRITE,
+			(void __user *)(unsigned long)mem->userspace_addr,
+			mem->memory_size)))
+		goto out;
+	if (as_id >= VMRUN_ADDRESS_SPACE_NUM || id >= VMRUN_MEM_SLOTS_NUM)
+		goto out;
+	if (mem->guest_phys_addr + mem->memory_size < mem->guest_phys_addr)
+		goto out;
+
+	slot = id_to_memslot(__vmrun_memslots(vmrun, as_id), id);
+	base_gfn = mem->guest_phys_addr >> PAGE_SHIFT;
+	npages = mem->memory_size >> PAGE_SHIFT;
+
+	if (npages > VMRUN_MEM_MAX_NR_PAGES)
+		goto out;
+
+	new = old = *slot;
+
+	new.id = id;
+	new.base_gfn = base_gfn;
+	new.npages = npages;
+	new.flags = mem->flags;
+
+	if (npages) {
+		if (!old.npages)
+			change = VMRUN_MR_CREATE;
+		else { /* Modify an existing slot. */
+			if ((mem->userspace_addr != old.userspace_addr) ||
+			    (npages != old.npages) ||
+			    ((new.flags ^ old.flags) & VMRUN_MEM_READONLY))
+				goto out;
+
+			if (base_gfn != old.base_gfn)
+				change = VMRUN_MR_MOVE;
+			else if (new.flags != old.flags)
+				change = VMRUN_MR_FLAGS_ONLY;
+			else { /* Nothing to change. */
+				r = 0;
+				goto out;
+			}
+		}
+	} else {
+		if (!old.npages)
+			goto out;
+
+		change = VMRUN_MR_DELETE;
+		new.base_gfn = 0;
+		new.flags = 0;
+	}
+
+	if ((change == VMRUN_MR_CREATE) || (change == VMRUN_MR_MOVE)) {
+		/* Check for overlaps */
+		r = -EEXIST;
+		vmrun_for_each_memslot(slot, __vmrun_memslots(vmrun, as_id)) {
+			if ((slot->id >= VMRUN_USER_MEM_SLOTS) ||
+			    (slot->id == id))
+				continue;
+			if (!((base_gfn + npages <= slot->base_gfn) ||
+			      (base_gfn >= slot->base_gfn + slot->npages)))
+				goto out;
+		}
+	}
+
+	/* Free page dirty bitmap if unneeded */
+	if (!(new.flags & VMRUN_MEM_LOG_DIRTY_PAGES))
+		new.dirty_bitmap = NULL;
+
+	r = -ENOMEM;
+	if (change == VMRUN_MR_CREATE) {
+		new.userspace_addr = mem->userspace_addr;
+
+		if (vmrun_arch_create_memslot(vmrun, &new, npages))
+			goto out_free;
+	}
+
+	/* Allocate page dirty bitmap if needed */
+	if ((new.flags & VMRUN_MEM_LOG_DIRTY_PAGES) && !new.dirty_bitmap) {
+		if (vmrun_create_dirty_bitmap(&new) < 0)
+			goto out_free;
+	}
+
+	slots = kvzalloc(sizeof(struct vmrun_memslots), GFP_KERNEL);
+	if (!slots)
+		goto out_free;
+	memcpy(slots, __vmrun_memslots(vmrun, as_id), sizeof(struct vmrun_memslots));
+
+	if ((change == VMRUN_MR_DELETE) || (change == VMRUN_MR_MOVE)) {
+		slot = id_to_memslot(slots, id);
+		slot->flags |= VMRUN_MEMSLOT_INVALID;
+
+		old_memslots = install_new_memslots(vmrun, as_id, slots);
+
+		/* From this point no new shadow pages pointing to a deleted,
+		 * or moved, memslot will be created.
+		 *
+		 * validation of sp->gfn happens in:
+		 *	- gfn_to_hva (vmrun_read_guest, gfn_to_pfn)
+		 *	- vmrun_is_visible_gfn (mmu_check_roots)
+		 */
+		vmrun_arch_flush_shadow_memslot(vmrun, slot);
+
+		/*
+		 * We can re-use the old_memslots from above, the only difference
+		 * from the currently installed memslots is the invalid flag.  This
+		 * will get overwritten by update_memslots anyway.
+		 */
+		slots = old_memslots;
+	}
+
+	r = vmrun_arch_prepare_memory_region(vmrun, &new, mem, change);
+	if (r)
+		goto out_slots;
+
+	/* actual memory is freed via old in vmrun_free_memslot below */
+	if (change == VMRUN_MR_DELETE) {
+		new.dirty_bitmap = NULL;
+		memset(&new.arch, 0, sizeof(new.arch));
+	}
+
+	update_memslots(slots, &new);
+	old_memslots = install_new_memslots(vmrun, as_id, slots);
+
+	vmrun_arch_commit_memory_region(vmrun, mem, &old, &new, change);
+
+	vmrun_free_memslot(vmrun, &old, &new);
+	kvfree(old_memslots);
+	return 0;
+
+	out_slots:
+	kvfree(slots);
+	out_free:
+	vmrun_free_memslot(vmrun, &new, &old);
+	out:
+	return r;
+}
+
+int vmrun_set_memory_region(struct vmrun *vmrun,
+			  const struct vmrun_userspace_memory_region *mem)
+{
+	int r;
+
+	mutex_lock(&vmrun->slots_lock);
+	r = __vmrun_set_memory_region(vmrun, mem);
+	mutex_unlock(&vmrun->slots_lock);
+	return r;
+}
+
+static int vmrun_vm_ioctl_set_memory_region(struct vmrun *vmrun,
+					  struct vmrun_userspace_memory_region *mem)
+{
+	if ((u16)mem->slot >= VMRUN_USER_MEM_SLOTS)
+		return -EINVAL;
+
+	return vmrun_set_memory_region(vmrun, mem);
 }
 
 static long vmrun_vm_ioctl(struct file *filp,
 			 unsigned int ioctl, unsigned long arg)
 {
 	struct vmrun *vmrun = filp->private_data;
-	void __user *argp = (void __user *)arg;
+	void __user *argp   = (void __user *)arg;
 	int r;
 
 	if (vmrun->mm != current->mm)
 		return -EIO;
+
 	switch (ioctl) {
 		case VMRUN_CREATE_VCPU:
 			r = vmrun_vm_ioctl_create_vcpu(vmrun, arg);
 			break;
+
 		case VMRUN_SET_USER_MEMORY_REGION: {
 			struct vmrun_userspace_memory_region vmrun_userspace_mem;
 
 			r = -EFAULT;
-			if (copy_from_user(&vmrun_userspace_mem, argp,
+			if (copy_from_user(&vmrun_userspace_mem,
+					   argp,
 					   sizeof(vmrun_userspace_mem)))
 				goto out;
 
 			r = vmrun_vm_ioctl_set_memory_region(vmrun, &vmrun_userspace_mem);
 			break;
 		}
-		case VMRUN_GET_DIRTY_LOG: {
-			struct vmrun_dirty_log log;
 
-			r = -EFAULT;
-			if (copy_from_user(&log, argp, sizeof(log)))
-				goto out;
-			r = vmrun_vm_ioctl_get_dirty_log(vmrun, &log);
-			break;
-		}
-#ifdef CONFIG_VMRUN_MMIO
-		case VMRUN_REGISTER_COALESCED_MMIO: {
-			struct vmrun_coalesced_mmio_zone zone;
-
-			r = -EFAULT;
-			if (copy_from_user(&zone, argp, sizeof(zone)))
-				goto out;
-			r = vmrun_vm_ioctl_register_coalesced_mmio(vmrun, &zone);
-			break;
-		}
-		case VMRUN_UNREGISTER_COALESCED_MMIO: {
-			struct vmrun_coalesced_mmio_zone zone;
-
-			r = -EFAULT;
-			if (copy_from_user(&zone, argp, sizeof(zone)))
-				goto out;
-			r = vmrun_vm_ioctl_unregister_coalesced_mmio(vmrun, &zone);
-			break;
-		}
-#endif
-		case VMRUN_IRQFD: {
-			struct vmrun_irqfd data;
-
-			r = -EFAULT;
-			if (copy_from_user(&data, argp, sizeof(data)))
-				goto out;
-			r = vmrun_irqfd(vmrun, &data);
-			break;
-		}
-		case VMRUN_IOEVENTFD: {
-			struct vmrun_ioeventfd data;
-
-			r = -EFAULT;
-			if (copy_from_user(&data, argp, sizeof(data)))
-				goto out;
-			r = vmrun_ioeventfd(vmrun, &data);
-			break;
-		}
-#ifdef CONFIG_HAVE_VMRUN_MSI
-		case VMRUN_SIGNAL_MSI: {
-			struct vmrun_msi msi;
-
-			r = -EFAULT;
-			if (copy_from_user(&msi, argp, sizeof(msi)))
-				goto out;
-			r = vmrun_send_userspace_msi(vmrun, &msi);
-			break;
-		}
-#endif
-#ifdef __VMRUN_HAVE_IRQ_LINE
-		case VMRUN_IRQ_LINE_STATUS:
-	case VMRUN_IRQ_LINE: {
-		struct vmrun_irq_level irq_event;
-
-		r = -EFAULT;
-		if (copy_from_user(&irq_event, argp, sizeof(irq_event)))
-			goto out;
-
-		r = vmrun_vm_ioctl_irq_line(vmrun, &irq_event,
-					ioctl == VMRUN_IRQ_LINE_STATUS);
-		if (r)
-			goto out;
-
-		r = -EFAULT;
-		if (ioctl == VMRUN_IRQ_LINE_STATUS) {
-			if (copy_to_user(argp, &irq_event, sizeof(irq_event)))
-				goto out;
-		}
-
-		r = 0;
-		break;
-	}
-#endif
-#ifdef CONFIG_HAVE_VMRUN_IRQ_ROUTING
-		case VMRUN_SET_GSI_ROUTING: {
-			struct vmrun_irq_routing routing;
-			struct vmrun_irq_routing __user *urouting;
-			struct vmrun_irq_routing_entry *entries = NULL;
-
-			r = -EFAULT;
-			if (copy_from_user(&routing, argp, sizeof(routing)))
-				goto out;
-			r = -EINVAL;
-			if (!vmrun_arch_can_set_irq_routing(vmrun))
-				goto out;
-			if (routing.nr > VMRUN_MAX_IRQ_ROUTES)
-				goto out;
-			if (routing.flags)
-				goto out;
-			if (routing.nr) {
-				r = -ENOMEM;
-				entries = vmalloc(routing.nr * sizeof(*entries));
-				if (!entries)
-					goto out;
-				r = -EFAULT;
-				urouting = argp;
-				if (copy_from_user(entries, urouting->entries,
-						   routing.nr * sizeof(*entries)))
-					goto out_free_irq_routing;
-			}
-			r = vmrun_set_irq_routing(vmrun, entries, routing.nr,
-						routing.flags);
-			out_free_irq_routing:
-			vfree(entries);
-			break;
-		}
-#endif /* CONFIG_HAVE_VMRUN_IRQ_ROUTING */
-		case VMRUN_CREATE_DEVICE: {
-			struct vmrun_create_device cd;
-
-			r = -EFAULT;
-			if (copy_from_user(&cd, argp, sizeof(cd)))
-				goto out;
-
-			r = vmrun_ioctl_create_device(vmrun, &cd);
-			if (r)
-				goto out;
-
-			r = -EFAULT;
-			if (copy_to_user(argp, &cd, sizeof(cd)))
-				goto out;
-
-			r = 0;
-			break;
-		}
-		case VMRUN_CHECK_EXTENSION:
-			r = vmrun_vm_ioctl_check_extension_generic(vmrun, arg);
-			break;
 		default:
-			r = vmrun_arch_vm_ioctl(filp, ioctl, arg);
+			;
 	}
-	out:
+
+out:
 	return r;
 }
 

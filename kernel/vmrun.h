@@ -67,7 +67,7 @@
 #define MSRPM_ALLOC_ORDER         1
 
 #define SEG_TYPE_LDT              2
-#define SEG_TYPE_AVAIL_TSS64      9
+#define SEG_TYPE_AVAIL_TSS16      3
 
 #define INVALID_PAGE              (~(hpa_t)0)
 
@@ -142,7 +142,7 @@ enum {
 	VMCB_DIRTY_MAX,
 };
 
-enum reg {
+enum vmrun_reg {
 	VCPU_REGS_RAX = 0,
 	VCPU_REGS_RCX = 1,
 	VCPU_REGS_RDX = 2,
@@ -151,8 +151,8 @@ enum reg {
 	VCPU_REGS_RBP = 5,
 	VCPU_REGS_RSI = 6,
 	VCPU_REGS_RDI = 7,
-	VCPU_REGS_R8 = 8,
-	VCPU_REGS_R9 = 9,
+	VCPU_REGS_R8  = 8,
+	VCPU_REGS_R9  = 9,
 	VCPU_REGS_R10 = 10,
 	VCPU_REGS_R11 = 11,
 	VCPU_REGS_R12 = 12,
@@ -205,19 +205,37 @@ struct vmrun_vcpu {
 	int srcu_idx;
 	int mode;
 	unsigned long requests;
+	int pre_pcpu;
 	struct list_head blocked_vcpu_list;
 	struct mutex mutex;
-	struct kvm_run *run;
+	struct vmrun_run *run;
 	struct pid __rcu *pid;
+
+	/*
+	 * [CONFIG_HAVE_KVM_CPU_RELAX_INTERCEPT]
+	 * Cpu relax intercept or pause loop exit optimization
+	 * in_spin_loop: set when a vcpu does a pause loop exit
+	 *  or cpu relax intercepted.
+	 * dy_eligible: indicates whether vcpu is eligible for directed yield.
+	 */
+	struct {
+		bool in_spin_loop;
+		bool dy_eligible;
+	} spin_loop;
+
+	bool preempted;
+
+	unsigned long cr0;
+	u32 hflags;
+	u64 efer;
 
 	// SVM (Some are old)
 	struct vmcb *vmcb;
 	unsigned long vmcb_pa;
 	struct vmrun_cpu_data *cpu_data;
 	uint64_t asid_generation;
-	unsigned long cr0;
-	u32 hflags;
-	u64 efer;
+	uint64_t sysenter_esp;
+	uint64_t sysenter_eip;
 	u64 next_rip;
 	struct {
 		u16 fs;
@@ -225,11 +243,16 @@ struct vmrun_vcpu {
 		u16 ldt;
 		u64 gs_base;
 	} host;
-	u32 *msrpm;
+	//u32 *msrpm;
+	/*
+	 * rip and regs accesses must go through
+	 * vmrun_{register,rip}_{read,write} functions.
+	 */
 	unsigned long regs[NR_VCPU_REGS];
+	u32 regs_avail;
+	u32 regs_dirty;
 	struct vmrun_mmu mmu;
 	struct list_head free_pages;
-	bool preempted;
 };
 
 struct vmrun_rmap_head {
@@ -302,7 +325,10 @@ struct vmrun {
 void vmrun_mmu_init_vm(struct vmrun *vmrun);
 void vmrun_mmu_uninit_vm(struct vmrun *kvm);
 void vmrun_mmu_destroy(struct vmrun_vcpu *vcpu);
+int vmrun_mmu_create(struct vmrun_vcpu *vcpu);
+void vmrun_mmu_setup(struct vmrun_vcpu *vcpu);
 void vmrun_mmu_unload(struct vmrun_vcpu *vcpu);
+void vmrun_mmu_reset_context(struct vmrun_vcpu *vcpu);
 int vmrun_unmap_hva_range(struct vmrun *vmrun, unsigned long start, unsigned long end);
 int vmrun_age_hva(struct vmrun *vmrun, unsigned long start, unsigned long end);
 int vmrun_test_age_hva(struct vmrun *vmrun, unsigned long hva);

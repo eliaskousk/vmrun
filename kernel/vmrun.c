@@ -266,24 +266,24 @@ static void vmrun_vmcb_init(struct vmrun_vcpu *vcpu)
 {
 	struct vmcb_control_area *control = &vcpu->vmcb->control;
 	struct vmcb_save_area    *save    = &vcpu->vmcb->save;
+
 	unsigned long cr0 = X86_CR0_NW | X86_CR0_CD | X86_CR0_ET;
 
 	control->intercept |= (1ULL << INTERCEPT_INTR);
 	control->intercept |= (1ULL << INTERCEPT_NMI);
 	control->intercept |= (1ULL << INTERCEPT_SMI);
-	control->intercept |= (1ULL << INTERCEPT_VMRUN);   // Needed?
+	control->intercept |= (1ULL << INTERCEPT_VMRUN);
 	control->intercept |= (1ULL << INTERCEPT_VMMCALL);
 	control->clean     &= ~(1 << VMCB_INTERCEPTS);
 
-	control->iopm_base_pa  = iopm_base;
-	control->msrpm_base_pa = __pa(vcpu->msrpm);
+	control->iopm_base_pa  = __sme_set(iopm_base);
 	control->int_ctl       = V_INTR_MASK;
 
-	init_seg(&save->es);
-	init_seg(&save->ss);
-	init_seg(&save->ds);
-	init_seg(&save->fs);
-	init_seg(&save->gs);
+	vmrun_init_seg(&save->es);
+	vmrun_init_seg(&save->ss);
+	vmrun_init_seg(&save->ds);
+	vmrun_init_seg(&save->fs);
+	vmrun_init_seg(&save->gs);
 
 	save->cs.selector = 0xf000;
 	save->cs.base = 0xffff0000;
@@ -295,16 +295,15 @@ static void vmrun_vmcb_init(struct vmrun_vcpu *vcpu)
 	save->gdtr.limit = 0xffff;
 	save->idtr.limit = 0xffff;
 
-	init_sys_seg(&save->ldtr, SEG_TYPE_LDT);
-	init_sys_seg(&save->tr, SEG_TYPE_AVAIL_TSS64);
+	vmrun_init_sys_seg(&save->ldtr, SEG_TYPE_LDT);
+	vmrun_init_sys_seg(&save->tr, SEG_TYPE_AVAIL_TSS16);
 
-	save->rip = 0x0000fff0;
-	save->rflags = 2;
-	save->dr6 = 0xffff0ff0;
-
-	save->efer = EFER_SVME | EFER_LME | EFER_LMA;
+	save->efer = EFER_SVME;
 	save->cr0 = cr0 | X86_CR0_PE | X86_CR0_PG | X86_CR0_WP;
 	save->cr4 = X86_CR4_PAE;
+	save->rip = 0x0000fff0;
+	save->dr6 = 0xffff0ff0;
+	save->rflags = 2;
 	control->clean &= ~(1 << VMCB_CR);
 	control->clean = 0;
 
@@ -313,9 +312,12 @@ static void vmrun_vmcb_init(struct vmrun_vcpu *vcpu)
 	vcpu->hflags |= HF_GIF_MASK;
 	vcpu->asid_generation = 0;
 	vcpu->regs[VCPU_REGS_RIP] = save->rip;
+
+	vmrun_mmu_reset_context(vcpu);
+	vmrun_make_request(VMRUN_REQ_EVENT, vcpu); // Needed?
 }
 
-static void vmrun_vcpu_setup(struct vmrun_vcpu *vcpu)
+static void vmrun_vcpu_setup_old(struct vmrun_vcpu *vcpu)
 {
 	struct system_table gdt, idt;
 	u64 tr_base, tr_base_lo, tr_base_hi, tr_base_real;
@@ -538,10 +540,42 @@ static void vmrun_vcpu_run(struct vmrun_vcpu *vcpu)
 	put_cpu();
 }
 
-static void vmrun_vcpu_free(struct vmrun_vcpu *vcpu)
+static inline struct vmrun_vcpu *vmrun_get_vcpu(struct vmrun *vmrun, int i)
 {
-	__free_page(pfn_to_page(vcpu->vmcb_pa >> PAGE_SHIFT));
-	kfree(vcpu);
+	/* Pairs with smp_wmb() in vmrun_vm_ioctl_create_vcpu, in case
+	 * the caller has read vmrun->online_vcpus before (as is the case
+	 * for vmrun_for_each_vcpu, for example).
+	 */
+	smp_rmb();
+
+	return vmrun->vcpus[i];
+}
+
+#define vmrun_for_each_vcpu(idx, vcpup, vmrun) \
+	for (idx = 0; \
+	     idx < atomic_read(&vmrun->online_vcpus) && \
+	     (vcpup = vmrun_get_vcpu(vmrun, idx)) != NULL; \
+	     idx++)
+
+static inline struct vmrun_vcpu *vmrun_get_vcpu_by_id(struct vmrun *vmrun, int id)
+{
+	struct vmrun_vcpu *vcpu = NULL;
+	int i;
+
+	if (id < 0)
+		return NULL;
+	
+	if (id < VMRUN_MAX_VCPUS)
+		vcpu = vmrun_get_vcpu(vmrun, id);
+	
+	if (vcpu && vcpu->vcpu_id == id)
+		return vcpu;
+	
+	vmrun_for_each_vcpu(i, vcpu, vmrun)
+		if (vcpu->vcpu_id == id)
+			return vcpu;
+	
+	return NULL;
 }
 
 static void vmrun_svm_vcpu_load(struct vmrun_vcpu *vcpu, int cpu)
@@ -586,6 +620,7 @@ void vmrun_vcpu_put(struct vmrun_vcpu *vcpu)
 	vmrun_svm_vcpu_put(vcpu);
 	preempt_notifier_unregister(&vcpu->preempt_notifier);
 	preempt_enable();
+
 	mutex_unlock(&vcpu->mutex);
 }
 
@@ -604,106 +639,57 @@ bool vmrun_vcpu_wake_up(struct vmrun_vcpu *vcpu)
 	return false;
 }
 
-static void vmrun_svm_vcpu_create(struct vmrun_vcpu *vcpu)
+bool vmrun_vcpu_is_reset_bsp(struct vmrun_vcpu *vcpu)
 {
-	struct page *vmcb_page;
-	struct page *msrpm_pages;
-	int me = raw_smp_processor_id();
-	int err;
+	return vcpu->vmrun->arch.bsp_vcpu_id == vcpu->vcpu_id;
+}
 
-	vcpu = kzalloc(sizeof(struct vmrun_vcpu), GFP_KERNEL);
-	if (!vcpu) {
-		err = -ENOMEM;
-		goto out;
+bool vmrun_vcpu_is_bsp(struct vmrun_vcpu *vcpu)
+{
+	return (vcpu->arch.apic_base & MSR_IA32_APICBASE_BSP) != 0;
+}
+
+int vmrun_vcpu_init(struct vmrun_vcpu *vcpu, struct vmrun *vmrun, unsigned id)
+{
+	struct page *run_page;
+	int r;
+
+	mutex_init(&vcpu->mutex);
+	vcpu->cpu = -1;
+	vcpu->vmrun = vmrun;
+	vcpu->vcpu_id = id;
+	vcpu->pid = NULL;
+
+	vcpu->pre_pcpu = -1;
+	INIT_LIST_HEAD(&vcpu->blocked_vcpu_list);
+
+	run_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+
+	if (!run_page) {
+		r = -ENOMEM;
+		goto fail;
 	}
 
-	printk("vcpu_create: [%d] Allocated vcpu memory (cpu = %d)\n", id, me);
+	vcpu->run = page_address(run_page);
 
-	vcpu->cpu = me;
-	vcpu->vcpu_id = id;
+	vcpu->spin_loop.in_spin_loop = false;
+	vcpu->spin_loop.dy_eligible  = false;
+	vcpu->preempted = false;
 
-	err = -ENOMEM;
-	vmcb_page = alloc_page(GFP_KERNEL);
-	if (!vmcb_page)
-		goto free_vcpu;
+	r = vmrun_mmu_create(vcpu);
 
-	printk("vcpu_create: [%d] Allocated vmcb memory\n", id);
+	if (r < 0)
+		goto fail_free_run_page;
 
-	msrpm_pages = alloc_pages(GFP_KERNEL, MSRPM_ALLOC_ORDER);
-	if (!msrpm_pages)
-		goto free_vmcb;
+	// vcpu->pending_external_vector = -1;
+	// vcpu->preempted_in_kernel = false;
 
-	vcpu->msrpm = page_address(msrpm_pages);
-	memset(vcpu->msrpm, 0xff, PAGE_SIZE * (1 << MSRPM_ALLOC_ORDER));
+	return 0;
 
-	printk("vcpu_create: [%d] Allocated MSR permissions bitmap memory\n", id);
-
-	vcpu->vmcb = page_address(vmcb_page);
-	clear_page(vcpu->vmcb);
-	vcpu->vmcb_pa = page_to_pfn(vmcb_page) << PAGE_SHIFT;
-	vcpu->asid_generation = 0;
-	vmrun_vmcb_init(vcpu);
-
-	printk("vcpu_create: [%d] Initialized vmcb\n", id);
-
-	vcpu->cpu_data = per_cpu(cpu_data, me);
-	per_cpu(local_vcpu, me) = vcpu;
-	per_cpu(local_vmcb, me) = vcpu->vmcb;
-
-	return vcpu;
-
-free_vmcb:
-	__free_page(vmcb_page);
-free_vcpu:
-	kfree(vcpu);
-out:
-	return ERR_PTR(err);
-}
-
-/*
- * Free any memory in @free but not in @dont.
- */
-static void vmrun_free_physmem_slot(struct vmrun_memory_slot *free,
-				  struct vmrun_memory_slot *dont)
-{
-	int i;
-
-	if (!dont || free->phys_mem != dont->phys_mem)
-		if (free->phys_mem) {
-			for (i = 0; i < free->npages; ++i)
-				__free_page(free->phys_mem[i]);
-			vfree(free->phys_mem);
-		}
-
-	if (!dont || free->dirty_bitmap != dont->dirty_bitmap)
-		vfree(free->dirty_bitmap);
-
-	free->phys_mem = 0;
-	free->npages = 0;
-	free->dirty_bitmap = 0;
-}
-
-static void vmrun_free_physmem(struct vmrun *vmrun)
-{
-	int i;
-
-	for (i = 0; i < vmrun->nmemslots; ++i)
-		vmrun_free_physmem_slot(&vmrun->memslots[i], 0);
-}
-
-#define vmrun_for_each_vcpu(idx, vcpup, vmrun) \
-	for (idx = 0; \
-	     idx < atomic_read(&vmrun->online_vcpus) && \
-	     (vcpup = vmrun_get_vcpu(vmrun, idx)) != NULL; \
-	     idx++)
-
-static void vmrun_unload_vcpu_mmu(struct vmrun_vcpu *vcpu)
-{
-	int r;
-	r = vmrun_vcpu_load(vcpu);
-	BUG_ON(r);
-	vmrun_mmu_unload(vcpu);
-	vmrun_vcpu_put(vcpu);
+fail_free_run_page:
+	free_page((unsigned long)vcpu->run);
+fail:
+	return r;
 }
 
 void vmrun_vcpu_uninit(struct vmrun_vcpu *vcpu)
@@ -715,7 +701,6 @@ void vmrun_vcpu_uninit(struct vmrun_vcpu *vcpu)
 	 * will change the vcpu->pid pointer and on uninit all file
 	 * descriptors are already gone.
 	 */
-
 	put_pid(rcu_dereference_protected(vcpu->pid, 1));
 
 	idx = srcu_read_lock(&vcpu->vmrun->srcu);
@@ -725,13 +710,72 @@ void vmrun_vcpu_uninit(struct vmrun_vcpu *vcpu)
 	free_page((unsigned long)vcpu->run);
 }
 
-static void vmrun_svm_free_vcpu(struct vmrun_vcpu *vcpu)
+static void vmrun_vcpu_free(struct vmrun_vcpu *vcpu)
 {
 	__free_page(pfn_to_page(__sme_clr(vcpu->vmcb_pa) >> PAGE_SHIFT));
-	//__free_pages(virt_to_page(vcpu->msrpm), MSRPM_ALLOC_ORDER);
-
 	vmrun_vcpu_uninit(vcpu);
 	kmem_cache_free(vmrun_vcpu_cache, vcpu);
+}
+
+static struct vmrun_vcpu *vmrun_vcpu_create(struct vmrun *vmrun, unsigned int id)
+{
+	struct vmrun_vcpu *vcpu;
+	struct page *vmcb_page;
+	struct page *hsave_page;
+	int err;
+
+	vcpu->vmrun = vmrun;
+
+	vcpu = kmem_cache_zalloc(vmrun_vcpu_cache, GFP_KERNEL);
+	if (!vcpu) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	err = vmrun_vcpu_init(vcpu, vmrun, id);
+	if (err)
+		goto free_vcpu;
+
+	err = -ENOMEM;
+	vmcb_page = alloc_page(GFP_KERNEL);
+	if (!vmcb_page)
+		goto uninit_vcpu;
+
+	hsave_page = alloc_page(GFP_KERNEL);
+	if (!hsave_page)
+		goto free_vmcb_page;
+
+	vcpu->vmcb = page_address(vmcb_page);
+	clear_page(vcpu->vmcb);
+	vcpu->vmcb_pa = __sme_set(page_to_pfn(vmcb_page) << PAGE_SHIFT);
+	vcpu->asid_generation = 0;
+	vmrun_vmcb_init(vcpu);
+
+//	vcpu->cpu_data = per_cpu(cpu_data, me);
+//	per_cpu(local_vcpu, me) = vcpu;
+//	per_cpu(local_vmcb, me) = vcpu->vmcb;
+
+	printk("vcpu_create: Created vcpu\n");
+
+	return vcpu;
+
+free_vmcb_page:
+	__free_page(vmcb_page);
+uninit_vcpu:
+	vmrun_vcpu_uninit(vcpu);
+free_vcpu:
+	kmem_cache_free(vmrun_vcpu_cache, vcpu);
+out:
+	return ERR_PTR(err);
+}
+
+static void vmrun_vcpu_unload_mmu(struct vmrun_vcpu *vcpu)
+{
+	int r;
+	r = vmrun_vcpu_load(vcpu);
+	BUG_ON(r);
+	vmrun_mmu_unload(vcpu);
+	vmrun_vcpu_put(vcpu);
 }
 
 static void vmrun_free_vcpus(struct vmrun *vmrun)
@@ -744,11 +788,11 @@ static void vmrun_free_vcpus(struct vmrun *vmrun)
 	 */
 	vmrun_for_each_vcpu(i, vcpu, vmrun) {
 		//vmrun_clear_async_pf_completion_queue(vcpu);
-		vmrun_unload_vcpu_mmu(vcpu);
+		vmrun_vcpu_unload_mmu(vcpu);
 	}
 	
 	vmrun_for_each_vcpu(i, vcpu, vmrun)
-		vmrun_svm_free_vcpu(vcpu);
+		vmrun_vcpu_free(vcpu);
 
 	mutex_lock(&vmrun->lock);
 	
@@ -760,8 +804,509 @@ static void vmrun_free_vcpus(struct vmrun *vmrun)
 	mutex_unlock(&vmrun->lock);
 }
 
+void vmrun_vcpu_reset(struct vmrun_vcpu *vcpu, bool init_event)
+{
+	vcpu->hflags = 0;
+
+	// vcpu->cr2 = 0;
+	//vmrun_make_request(VMRUN_REQ_EVENT, vcpu);
+
+	memset(vcpu->regs, 0, sizeof(vcpu->regs));
+	vcpu->regs_avail = ~0;
+	vcpu->regs_dirty = ~0;
+
+	vmrun_vmcb_init(vcpu);
+
+	// u32 dummy;
+	// u32 eax = 1;
+	// vmrun_cpuid(vcpu, &eax, &dummy, &dummy, &dummy, true);
+	// vmrun_register_write(vcpu, VCPU_REGS_RDX, eax);
+}
+
+int vmrun_vcpu_setup(struct vmrun_vcpu *vcpu)
+{
+	int r;
+
+	r = vmrun_vcpu_load(vcpu);
+
+	if (r)
+		return r;
+
+	vmrun_vcpu_reset(vcpu, false);
+
+	vmrun_mmu_setup(vcpu);
+
+	vmrun_vcpu_put(vcpu);
+
+	return r;
+}
+
+void vmrun_vcpu_destroy(struct vmrun_vcpu *vcpu)
+{
+	int r;
+
+	//vcpu->arch.apf.msr_val = 0;
+
+	r = vmrun_vcpu_load(vcpu);
+
+	BUG_ON(r);
+
+	vmrun_mmu_unload(vcpu);
+
+	vmrun_vcpu_put(vcpu);
+
+	vmrun_vcpu_free(vcpu);
+}
+
+int vmrun_vcpu_ioctl_run(struct vmrun_vcpu *vcpu, struct vmrun_run *vmrun_run)
+{
+	struct fpu *fpu = &current->thread.fpu;
+	int r;
+	sigset_t sigsaved;
+
+	fpu__activate_curr(fpu);
+
+	if (vcpu->sigset_active)
+		sigprocmask(SIG_SETMASK, &vcpu->sigset, &sigsaved);
+
+	if (unlikely(vcpu->arch.mp_state == VMRUN_MP_STATE_UNINITIALIZED)) {
+		if (vmrun_run->immediate_exit) {
+			r = -EINTR;
+			goto out;
+		}
+		vmrun_vcpu_block(vcpu);
+		vmrun_apic_accept_events(vcpu);
+		vmrun_clear_request(VMRUN_REQ_UNHALT, vcpu);
+		r = -EAGAIN;
+		if (signal_pending(current)) {
+			r = -EINTR;
+			vcpu->run->exit_reason = VMRUN_EXIT_INTR;
+			++vcpu->stat.signal_exits;
+		}
+		goto out;
+	}
+
+	/* re-sync apic's tpr */
+	if (!lapic_in_kernel(vcpu)) {
+		if (vmrun_set_cr8(vcpu, vmrun_run->cr8) != 0) {
+			r = -EINVAL;
+			goto out;
+		}
+	}
+
+	if (unlikely(vcpu->arch.complete_userspace_io)) {
+		int (*cui)(struct vmrun_vcpu *) = vcpu->arch.complete_userspace_io;
+		vcpu->arch.complete_userspace_io = NULL;
+		r = cui(vcpu);
+		if (r <= 0)
+			goto out;
+	} else
+		WARN_ON(vcpu->arch.pio.count || vcpu->mmio_needed);
+
+	if (vmrun_run->immediate_exit)
+		r = -EINTR;
+	else
+		r = vcpu_run(vcpu);
+
+	out:
+	post_vmrun_run_save(vcpu);
+	if (vcpu->sigset_active)
+		sigprocmask(SIG_SETMASK, &sigsaved, NULL);
+
+	return r;
+}
+
+int vmrun_vcpu_ioctl_get_regs(struct vmrun_vcpu *vcpu, struct vmrun_regs *regs)
+{
+	if (vcpu->arch.emulate_regs_need_sync_to_vcpu) {
+		/*
+		 * We are here if userspace calls get_regs() in the middle of
+		 * instruction emulation. Registers state needs to be copied
+		 * back from emulation context to vcpu. Userspace shouldn't do
+		 * that usually, but some bad designed PV devices (vmware
+		 * backdoor interface) need this to work
+		 */
+		emulator_writeback_register_cache(&vcpu->arch.emulate_ctxt);
+		vcpu->arch.emulate_regs_need_sync_to_vcpu = false;
+	}
+	regs->rax = vmrun_register_read(vcpu, VCPU_REGS_RAX);
+	regs->rbx = vmrun_register_read(vcpu, VCPU_REGS_RBX);
+	regs->rcx = vmrun_register_read(vcpu, VCPU_REGS_RCX);
+	regs->rdx = vmrun_register_read(vcpu, VCPU_REGS_RDX);
+	regs->rsi = vmrun_register_read(vcpu, VCPU_REGS_RSI);
+	regs->rdi = vmrun_register_read(vcpu, VCPU_REGS_RDI);
+	regs->rsp = vmrun_register_read(vcpu, VCPU_REGS_RSP);
+	regs->rbp = vmrun_register_read(vcpu, VCPU_REGS_RBP);
+#ifdef CONFIG_X86_64
+	regs->r8 = vmrun_register_read(vcpu, VCPU_REGS_R8);
+	regs->r9 = vmrun_register_read(vcpu, VCPU_REGS_R9);
+	regs->r10 = vmrun_register_read(vcpu, VCPU_REGS_R10);
+	regs->r11 = vmrun_register_read(vcpu, VCPU_REGS_R11);
+	regs->r12 = vmrun_register_read(vcpu, VCPU_REGS_R12);
+	regs->r13 = vmrun_register_read(vcpu, VCPU_REGS_R13);
+	regs->r14 = vmrun_register_read(vcpu, VCPU_REGS_R14);
+	regs->r15 = vmrun_register_read(vcpu, VCPU_REGS_R15);
+#endif
+
+	regs->rip = vmrun_rip_read(vcpu);
+	regs->rflags = vmrun_get_rflags(vcpu);
+
+	return 0;
+}
+
+int vmrun_vcpu_ioctl_set_regs(struct vmrun_vcpu *vcpu, struct vmrun_regs *regs)
+{
+	vcpu->arch.emulate_regs_need_sync_from_vcpu = true;
+	vcpu->arch.emulate_regs_need_sync_to_vcpu = false;
+
+	vmrun_register_write(vcpu, VCPU_REGS_RAX, regs->rax);
+	vmrun_register_write(vcpu, VCPU_REGS_RBX, regs->rbx);
+	vmrun_register_write(vcpu, VCPU_REGS_RCX, regs->rcx);
+	vmrun_register_write(vcpu, VCPU_REGS_RDX, regs->rdx);
+	vmrun_register_write(vcpu, VCPU_REGS_RSI, regs->rsi);
+	vmrun_register_write(vcpu, VCPU_REGS_RDI, regs->rdi);
+	vmrun_register_write(vcpu, VCPU_REGS_RSP, regs->rsp);
+	vmrun_register_write(vcpu, VCPU_REGS_RBP, regs->rbp);
+#ifdef CONFIG_X86_64
+	vmrun_register_write(vcpu, VCPU_REGS_R8, regs->r8);
+	vmrun_register_write(vcpu, VCPU_REGS_R9, regs->r9);
+	vmrun_register_write(vcpu, VCPU_REGS_R10, regs->r10);
+	vmrun_register_write(vcpu, VCPU_REGS_R11, regs->r11);
+	vmrun_register_write(vcpu, VCPU_REGS_R12, regs->r12);
+	vmrun_register_write(vcpu, VCPU_REGS_R13, regs->r13);
+	vmrun_register_write(vcpu, VCPU_REGS_R14, regs->r14);
+	vmrun_register_write(vcpu, VCPU_REGS_R15, regs->r15);
+#endif
+
+	vmrun_rip_write(vcpu, regs->rip);
+	vmrun_set_rflags(vcpu, regs->rflags);
+
+	vcpu->arch.exception.pending = false;
+
+	vmrun_make_request(VMRUN_REQ_EVENT, vcpu);
+
+	return 0;
+}
+
+void vmrun_get_cs_db_l_bits(struct vmrun_vcpu *vcpu, int *db, int *l)
+{
+	struct vmrun_segment cs;
+
+	vmrun_get_segment(vcpu, &cs, VCPU_SREG_CS);
+	*db = cs.db;
+	*l = cs.l;
+}
+EXPORT_SYMBOL_GPL(vmrun_get_cs_db_l_bits);
+
+int vmrun_vcpu_ioctl_get_sregs(struct vmrun_vcpu *vcpu,
+				  struct vmrun_sregs *sregs)
+{
+	struct desc_ptr dt;
+
+	vmrun_get_segment(vcpu, &sregs->cs, VCPU_SREG_CS);
+	vmrun_get_segment(vcpu, &sregs->ds, VCPU_SREG_DS);
+	vmrun_get_segment(vcpu, &sregs->es, VCPU_SREG_ES);
+	vmrun_get_segment(vcpu, &sregs->fs, VCPU_SREG_FS);
+	vmrun_get_segment(vcpu, &sregs->gs, VCPU_SREG_GS);
+	vmrun_get_segment(vcpu, &sregs->ss, VCPU_SREG_SS);
+
+	vmrun_get_segment(vcpu, &sregs->tr, VCPU_SREG_TR);
+	vmrun_get_segment(vcpu, &sregs->ldt, VCPU_SREG_LDTR);
+
+	vmrun_x86_ops->get_idt(vcpu, &dt);
+	sregs->idt.limit = dt.size;
+	sregs->idt.base = dt.address;
+	vmrun_x86_ops->get_gdt(vcpu, &dt);
+	sregs->gdt.limit = dt.size;
+	sregs->gdt.base = dt.address;
+
+	sregs->cr0 = vmrun_read_cr0(vcpu);
+	sregs->cr2 = vcpu->arch.cr2;
+	sregs->cr3 = vmrun_read_cr3(vcpu);
+	sregs->cr4 = vmrun_read_cr4(vcpu);
+	sregs->cr8 = vmrun_get_cr8(vcpu);
+	sregs->efer = vcpu->arch.efer;
+	sregs->apic_base = vmrun_get_apic_base(vcpu);
+
+	memset(sregs->interrupt_bitmap, 0, sizeof sregs->interrupt_bitmap);
+
+	if (vcpu->arch.interrupt.pending && !vcpu->arch.interrupt.soft)
+		set_bit(vcpu->arch.interrupt.nr,
+			(unsigned long *)sregs->interrupt_bitmap);
+
+	return 0;
+}
+
+int vmrun_vcpu_ioctl_set_sregs(struct vmrun_vcpu *vcpu,
+				  struct vmrun_sregs *sregs)
+{
+	struct msr_data apic_base_msr;
+	int mmu_reset_needed = 0;
+	int pending_vec, max_bits, idx;
+	struct desc_ptr dt;
+
+	if (!guest_cpuid_has(vcpu, X86_FEATURE_XSAVE) &&
+	    (sregs->cr4 & X86_CR4_OSXSAVE))
+		return -EINVAL;
+
+	apic_base_msr.data = sregs->apic_base;
+	apic_base_msr.host_initiated = true;
+	if (vmrun_set_apic_base(vcpu, &apic_base_msr))
+		return -EINVAL;
+
+	dt.size = sregs->idt.limit;
+	dt.address = sregs->idt.base;
+	vmrun_x86_ops->set_idt(vcpu, &dt);
+	dt.size = sregs->gdt.limit;
+	dt.address = sregs->gdt.base;
+	vmrun_x86_ops->set_gdt(vcpu, &dt);
+
+	vcpu->arch.cr2 = sregs->cr2;
+	mmu_reset_needed |= vmrun_read_cr3(vcpu) != sregs->cr3;
+	vcpu->arch.cr3 = sregs->cr3;
+	__set_bit(VCPU_EXREG_CR3, (ulong *)&vcpu->arch.regs_avail);
+
+	vmrun_set_cr8(vcpu, sregs->cr8);
+
+	mmu_reset_needed |= vcpu->arch.efer != sregs->efer;
+	vmrun_x86_ops->set_efer(vcpu, sregs->efer);
+
+	mmu_reset_needed |= vmrun_read_cr0(vcpu) != sregs->cr0;
+	vmrun_x86_ops->set_cr0(vcpu, sregs->cr0);
+	vcpu->arch.cr0 = sregs->cr0;
+
+	mmu_reset_needed |= vmrun_read_cr4(vcpu) != sregs->cr4;
+	vmrun_x86_ops->set_cr4(vcpu, sregs->cr4);
+	if (sregs->cr4 & (X86_CR4_OSXSAVE | X86_CR4_PKE))
+		vmrun_update_cpuid(vcpu);
+
+	idx = srcu_read_lock(&vcpu->vmrun->srcu);
+	if (!is_long_mode(vcpu) && is_pae(vcpu)) {
+		load_pdptrs(vcpu, vcpu->arch.walk_mmu, vmrun_read_cr3(vcpu));
+		mmu_reset_needed = 1;
+	}
+	srcu_read_unlock(&vcpu->vmrun->srcu, idx);
+
+	if (mmu_reset_needed)
+		vmrun_mmu_reset_context(vcpu);
+
+	max_bits = VMRUN_NR_INTERRUPTS;
+	pending_vec = find_first_bit(
+		(const unsigned long *)sregs->interrupt_bitmap, max_bits);
+	if (pending_vec < max_bits) {
+		vmrun_queue_interrupt(vcpu, pending_vec, false);
+		pr_debug("Set back pending irq %d\n", pending_vec);
+	}
+
+	vmrun_set_segment(vcpu, &sregs->cs, VCPU_SREG_CS);
+	vmrun_set_segment(vcpu, &sregs->ds, VCPU_SREG_DS);
+	vmrun_set_segment(vcpu, &sregs->es, VCPU_SREG_ES);
+	vmrun_set_segment(vcpu, &sregs->fs, VCPU_SREG_FS);
+	vmrun_set_segment(vcpu, &sregs->gs, VCPU_SREG_GS);
+	vmrun_set_segment(vcpu, &sregs->ss, VCPU_SREG_SS);
+
+	vmrun_set_segment(vcpu, &sregs->tr, VCPU_SREG_TR);
+	vmrun_set_segment(vcpu, &sregs->ldt, VCPU_SREG_LDTR);
+
+	update_cr8_intercept(vcpu);
+
+	/* Older userspace won't unhalt the vcpu on reset. */
+	if (vmrun_vcpu_is_bsp(vcpu) && vmrun_rip_read(vcpu) == 0xfff0 &&
+	    sregs->cs.selector == 0xf000 && sregs->cs.base == 0xffff0000 &&
+	    !is_protmode(vcpu))
+		vcpu->arch.mp_state = VMRUN_MP_STATE_RUNNABLE;
+
+	vmrun_make_request(VMRUN_REQ_EVENT, vcpu);
+
+	return 0;
+}
+
+static long vmrun_vcpu_ioctl(struct file *filp,
+			     unsigned int ioctl,
+			     unsigned long arg)
+{
+	struct vmrun_vcpu *vcpu = filp->private_data;
+	void __user *argp = (void __user *)arg;
+	int r;
+	struct vmrun_sregs *vmrun_sregs = NULL;
+
+	if (vcpu->vmrun->mm != current->mm)
+		return -EIO;
+
+	if (unlikely(_IOC_TYPE(ioctl) != VMRUNIO))
+		return -EINVAL;
+
+	r = vmrun_vcpu_load(vcpu);
+	
+	if (r)
+		return r;
+	
+	switch (ioctl) {
+		case VMRUN_RUN: {
+			struct pid *oldpid;
+			r = -EINVAL;
+
+			if (arg)
+				goto out;
+
+			oldpid = rcu_access_pointer(vcpu->pid);
+
+			if (unlikely(oldpid != current->pids[PIDTYPE_PID].pid)) {
+				/* The thread running this VCPU changed. */
+				struct pid *newpid = get_task_pid(current, PIDTYPE_PID);
+
+				rcu_assign_pointer(vcpu->pid, newpid);
+
+				if (oldpid)
+					synchronize_rcu();
+
+				put_pid(oldpid);
+			}
+
+			r = vmrun_vcpu_ioctl_run(vcpu, vcpu->run);
+			break;
+		}
+
+		case VMRUN_GET_REGS: {
+			struct vmrun_regs *vmrun_regs;
+			r = -ENOMEM;
+
+			vmrun_regs = kzalloc(sizeof(struct vmrun_regs), GFP_KERNEL);
+
+			if (!vmrun_regs)
+				goto out;
+
+			r = vmrun_vcpu_ioctl_get_regs(vcpu, vmrun_regs);
+
+			if (r)
+				goto out_free1;
+			r = -EFAULT;
+
+			if (copy_to_user(argp, vmrun_regs, sizeof(struct vmrun_regs)))
+				goto out_free1;
+
+			r = 0;
+
+		out_free1:
+			kfree(vmrun_regs);
+			break;
+		}
+
+		case VMRUN_SET_REGS: {
+			struct vmrun_regs *vmrun_regs;
+			r = -ENOMEM;
+
+			vmrun_regs = memdup_user(argp, sizeof(*vmrun_regs));
+
+			if (IS_ERR(vmrun_regs)) {
+				r = PTR_ERR(vmrun_regs);
+				goto out;
+			}
+
+			r = vmrun_vcpu_ioctl_set_regs(vcpu, vmrun_regs);
+			kfree(vmrun_regs);
+			break;
+		}
+
+		case VMRUN_GET_SREGS: {
+			vmrun_sregs = kzalloc(sizeof(struct vmrun_sregs), GFP_KERNEL);
+			r = -ENOMEM;
+
+			if (!vmrun_sregs)
+				goto out;
+
+			r = vmrun_vcpu_ioctl_get_sregs(vcpu, vmrun_sregs);
+
+			if (r)
+				goto out;
+
+			r = -EFAULT;
+
+			if (copy_to_user(argp, vmrun_sregs, sizeof(struct vmrun_sregs)))
+				goto out;
+
+			r = 0;
+			break;
+		}
+
+		case VMRUN_SET_SREGS: {
+			vmrun_sregs = memdup_user(argp, sizeof(*vmrun_sregs));
+
+			if (IS_ERR(vmrun_sregs)) {
+				r = PTR_ERR(vmrun_sregs);
+				vmrun_sregs = NULL;
+				goto out;
+			}
+
+			r = vmrun_vcpu_ioctl_set_sregs(vcpu, vmrun_sregs);
+			break;
+		}
+		
+		default:
+			return -EINVAL;
+	}
+out:
+	vmrun_vcpu_put(vcpu);
+	kfree(vmrun_sregs);
+	return r;
+}
+
+static int vmrun_vcpu_fault(struct vm_fault *vmf)
+{
+	struct vmrun_vcpu *vcpu = vmf->vma->vm_file->private_data;
+	struct page *page;
+
+	if (vmf->pgoff == 0)
+		page = virt_to_page(vcpu->run);
+//	else if (vmf->pgoff == VMRUN_PIO_PAGE_OFFSET)
+//		page = virt_to_page(vcpu->arch.pio_data);
+	else
+		return VM_FAULT_SIGBUS;
+
+	get_page(page);
+
+	vmf->page = page;
+
+	return 0;
+}
+
+static const struct vm_operations_struct vmrun_vcpu_vm_ops = {
+	.fault = vmrun_vcpu_fault,
+};
+
+static int vmrun_vcpu_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	vma->vm_ops = &vmrun_vcpu_vm_ops;
+
+	return 0;
+}
+
+static int vmrun_vcpu_release(struct inode *inode, struct file *filp)
+{
+	struct vmrun_vcpu *vcpu = filp->private_data;
+
+	vmrun_put_vmrun(vcpu->vmrun);
+
+	return 0;
+}
+
+static struct file_operations vmrun_vcpu_fops = {
+	.release        = vmrun_vcpu_release,
+	.unlocked_ioctl = vmrun_vcpu_ioctl,
+	.mmap           = vmrun_vcpu_mmap,
+	.llseek		= noop_llseek,
+};
+
 /*
- * Creates some virtual cpus.  Good luck creating more than one.
+ * Allocates an inode for the vcpu.
+ */
+static int vmrun_create_vcpu_fd(struct vmrun_vcpu *vcpu)
+{
+	return anon_inode_getfd("vmrun-vcpu", &vmrun_vcpu_fops, vcpu, O_RDWR | O_CLOEXEC);
+}
+
+/*
+ * Creates some virtual cpus.  Good luck creating more than one. (!)
  */
 static int vmrun_vm_ioctl_create_vcpu(struct vmrun *vmrun, u32 id)
 {
@@ -772,15 +1317,18 @@ static int vmrun_vm_ioctl_create_vcpu(struct vmrun *vmrun, u32 id)
 		return -EINVAL;
 
 	mutex_lock(&vmrun->lock);
+
 	if (vmrun->created_vcpus == VMRUN_MAX_VCPUS) {
 		mutex_unlock(&vmrun->lock);
 		return -EINVAL;
 	}
 
 	vmrun->created_vcpus++;
+
 	mutex_unlock(&vmrun->lock);
 
-	vcpu = vmrun_arch_vcpu_create(vmrun, id);
+	vcpu = vmrun_vcpu_create(vmrun, id);
+
 	if (IS_ERR(vcpu)) {
 		r = PTR_ERR(vcpu);
 		goto vcpu_decrement;
@@ -788,15 +1336,13 @@ static int vmrun_vm_ioctl_create_vcpu(struct vmrun *vmrun, u32 id)
 
 	preempt_notifier_init(&vcpu->preempt_notifier, &vmrun_preempt_ops);
 
-	r = vmrun_arch_vcpu_setup(vcpu);
-	if (r)
-		goto vcpu_destroy;
+	r = vmrun_vcpu_setup(vcpu);
 
-	r = vmrun_create_vcpu_debugfs(vcpu);
 	if (r)
 		goto vcpu_destroy;
 
 	mutex_lock(&vmrun->lock);
+	
 	if (vmrun_get_vcpu_by_id(vmrun, id)) {
 		r = -EEXIST;
 		goto unlock_vcpu_destroy;
@@ -806,7 +1352,9 @@ static int vmrun_vm_ioctl_create_vcpu(struct vmrun *vmrun, u32 id)
 
 	/* Now it's all set up, let userspace reach it */
 	vmrun_get_vmrun(vmrun);
-	r = create_vcpu_fd(vcpu);
+	
+	r = vmrun_create_vcpu_fd(vcpu);
+	
 	if (r < 0) {
 		vmrun_put_vmrun(vmrun);
 		goto unlock_vcpu_destroy;
@@ -819,296 +1367,26 @@ static int vmrun_vm_ioctl_create_vcpu(struct vmrun *vmrun, u32 id)
 	 * before vmrun->online_vcpu's incremented value.
 	 */
 	smp_wmb();
+	
 	atomic_inc(&vmrun->online_vcpus);
 
 	mutex_unlock(&vmrun->lock);
-	vmrun_arch_vcpu_postcreate(vcpu);
+	
 	return r;
 
-	unlock_vcpu_destroy:
+unlock_vcpu_destroy:
 	mutex_unlock(&vmrun->lock);
-	debugfs_remove_recursive(vcpu->debugfs_dentry);
-	vcpu_destroy:
-	vmrun_arch_vcpu_destroy(vcpu);
-	vcpu_decrement:
+	
+vcpu_destroy:
+	vmrun_vcpu_destroy(vcpu);
+	
+vcpu_decrement:
 	mutex_lock(&vmrun->lock);
 	vmrun->created_vcpus--;
 	mutex_unlock(&vmrun->lock);
+	
 	return r;
 }
-
-static int vmrun_dev_ioctl_vcpu_run(struct vmrun *vmrun, struct vmrun_run *run)
-{
-	struct vmrun_vcpu *vcpu;
-	int r;
-
-	if (run->vcpu < 0 || run->vcpu >= VMRUN_MAX_VCPUS)
-		return -EINVAL;
-
-	vcpu = vmrun_vcpu_load(vmrun, run->vcpu);
-
-	if (!vcpu)
-		return -ENOENT;
-
-	if (run->emulated) {
-		svm_skip_emulated_instruction(vcpu);
-		run->emulated = 0;
-	}
-
-	if (run->mmio_completed) {
-		memcpy(vcpu->mmio_data, run->mmio.data, 8);
-		vcpu->mmio_read_completed = 1;
-	}
-
-	vcpu->mmio_needed = 0;
-
-	r = vmrun_vcpu_run(vcpu, run);
-
-	vmrun_vcpu_put(vcpu);
-
-	return r;
-}
-
-static int vmrun_dev_ioctl_get_regs(struct vmrun *vmrun, struct vmrun_regs *regs)
-{
-	struct vmrun_vcpu *vcpu;
-
-	if (regs->vcpu < 0 || regs->vcpu >= VMRUN_MAX_VCPUS)
-		return -EINVAL;
-
-	vcpu = vmrun_vcpu_load(vmrun, regs->vcpu);
-
-	if (!vcpu)
-		return -ENOENT;
-
-	svm_cache_regs(vcpu);
-
-	regs->rax = vcpu->regs[VCPU_REGS_RAX];
-	regs->rbx = vcpu->regs[VCPU_REGS_RBX];
-	regs->rcx = vcpu->regs[VCPU_REGS_RCX];
-	regs->rdx = vcpu->regs[VCPU_REGS_RDX];
-	regs->rsi = vcpu->regs[VCPU_REGS_RSI];
-	regs->rdi = vcpu->regs[VCPU_REGS_RDI];
-	regs->rsp = vcpu->regs[VCPU_REGS_RSP];
-	regs->rbp = vcpu->regs[VCPU_REGS_RBP];
-	regs->r8 = vcpu->regs[VCPU_REGS_R8];
-	regs->r9 = vcpu->regs[VCPU_REGS_R9];
-	regs->r10 = vcpu->regs[VCPU_REGS_R10];
-	regs->r11 = vcpu->regs[VCPU_REGS_R11];
-	regs->r12 = vcpu->regs[VCPU_REGS_R12];
-	regs->r13 = vcpu->regs[VCPU_REGS_R13];
-	regs->r14 = vcpu->regs[VCPU_REGS_R14];
-	regs->r15 = vcpu->regs[VCPU_REGS_R15];
-	regs->rip = vcpu->rip;
-	regs->rflags = svm_get_rflags(vcpu);
-
-	/*
-	 * Don't leak debug flags in case they were set for guest debugging
-	 */
-	if (vcpu->guest_debug.enabled && vcpu->guest_debug.singlestep)
-		regs->rflags &= ~(X86_EFLAGS_TF | X86_EFLAGS_RF);
-
-	vmrun_vcpu_put(vcpu);
-
-	return 0;
-}
-
-static int vmrun_dev_ioctl_set_regs(struct vmrun *vmrun, struct vmrun_regs *regs)
-{
-	struct vmrun_vcpu *vcpu;
-
-	if (regs->vcpu < 0 || regs->vcpu >= VMRUN_MAX_VCPUS)
-		return -EINVAL;
-
-	vcpu = vmrun_vcpu_load(vmrun, regs->vcpu);
-
-	if (!vcpu)
-		return -ENOENT;
-
-	vcpu->regs[VCPU_REGS_RAX] = regs->rax;
-	vcpu->regs[VCPU_REGS_RBX] = regs->rbx;
-	vcpu->regs[VCPU_REGS_RCX] = regs->rcx;
-	vcpu->regs[VCPU_REGS_RDX] = regs->rdx;
-	vcpu->regs[VCPU_REGS_RSI] = regs->rsi;
-	vcpu->regs[VCPU_REGS_RDI] = regs->rdi;
-	vcpu->regs[VCPU_REGS_RSP] = regs->rsp;
-	vcpu->regs[VCPU_REGS_RBP] = regs->rbp;
-	vcpu->regs[VCPU_REGS_R8]  = regs->r8;
-	vcpu->regs[VCPU_REGS_R9]  = regs->r9;
-	vcpu->regs[VCPU_REGS_R10] = regs->r10;
-	vcpu->regs[VCPU_REGS_R11] = regs->r11;
-	vcpu->regs[VCPU_REGS_R12] = regs->r12;
-	vcpu->regs[VCPU_REGS_R13] = regs->r13;
-	vcpu->regs[VCPU_REGS_R14] = regs->r14;
-	vcpu->regs[VCPU_REGS_R15] = regs->r15;
-
-	vcpu->rip = regs->rip;
-
-	svm_set_rflags(vcpu, regs->rflags);
-	svm_decache_regs(vcpu);
-
-	vcpu_put(vcpu);
-
-	return 0;
-}
-
-static void get_segment(struct vmrun_vcpu *vcpu,
-			struct vmrun_segment *var, int seg)
-{
-	return vmrun_arch_ops->get_segment(vcpu, var, seg);
-}
-
-static int vmrun_dev_ioctl_get_sregs(struct vmrun *vmrun, struct vmrun_sregs *sregs)
-{
-	struct vmrun_vcpu *vcpu;
-	struct descriptor_table dt;
-
-	if (sregs->vcpu < 0 || sregs->vcpu >= VMRUN_MAX_VCPUS)
-		return -EINVAL;
-
-	vcpu = vcpu_load(vmrun, sregs->vcpu);
-
-	if (!vcpu)
-		return -ENOENT;
-
-	get_segment(vcpu, &sregs->cs,  VCPU_SREG_CS);
-	get_segment(vcpu, &sregs->ds,  VCPU_SREG_DS);
-	get_segment(vcpu, &sregs->es,  VCPU_SREG_ES);
-	get_segment(vcpu, &sregs->fs,  VCPU_SREG_FS);
-	get_segment(vcpu, &sregs->gs,  VCPU_SREG_GS);
-	get_segment(vcpu, &sregs->ss,  VCPU_SREG_SS);
-	get_segment(vcpu, &sregs->tr,  VCPU_SREG_TR);
-	get_segment(vcpu, &sregs->ldt, VCPU_SREG_LDTR);
-
-	get_idt(vcpu, &dt);
-	sregs->idt.limit = dt.limit;
-	sregs->idt.base  = dt.base;
-	get_gdt(vcpu, &dt);
-	sregs->gdt.limit = dt.limit;
-	sregs->gdt.base  = dt.base;
-	sregs->cr0       = vcpu->cr0;
-	sregs->cr2       = vcpu->cr2;
-	sregs->cr3       = vcpu->cr3;
-	sregs->cr4       = vcpu->cr4;
-	sregs->cr8       = vcpu->cr8;
-	sregs->efer      = vcpu->shadow_efer;
-	sregs->apic_base = vcpu->apic_base;
-
-	memcpy(sregs->interrupt_bitmap,
-	       vcpu->irq_pending,
-	       sizeof sregs->interrupt_bitmap);
-
-	vcpu_put(vcpu);
-
-	return 0;
-}
-
-static void set_segment(struct vmrun_vcpu *vcpu,
-			struct vmrun_segment *var, int seg)
-{
-	return vmrun_arch_ops->set_segment(vcpu, var, seg);
-}
-
-static int vmrun_dev_ioctl_set_sregs(struct vmrun *vmrun, struct vmrun_sregs *sregs)
-{
-	struct vmrun_vcpu *vcpu;
-	int mmu_reset_needed = 0;
-	int i;
-	struct descriptor_table dt;
-
-	if (sregs->vcpu < 0 || sregs->vcpu >= VMRUN_MAX_VCPUS)
-		return -EINVAL;
-
-	vcpu = vmrun_vcpu_load(vmrun, sregs->vcpu);
-
-	if (!vcpu)
-		return -ENOENT;
-
-	set_segment(vcpu, &sregs->cs,  VCPU_SREG_CS);
-	set_segment(vcpu, &sregs->ds,  VCPU_SREG_DS);
-	set_segment(vcpu, &sregs->es,  VCPU_SREG_ES);
-	set_segment(vcpu, &sregs->fs,  VCPU_SREG_FS);
-	set_segment(vcpu, &sregs->gs,  VCPU_SREG_GS);
-	set_segment(vcpu, &sregs->ss,  VCPU_SREG_SS);
-	set_segment(vcpu, &sregs->tr,  VCPU_SREG_TR);
-	set_segment(vcpu, &sregs->ldt, VCPU_SREG_LDTR);
-
-	dt.limit = sregs->idt.limit;
-	dt.base = sregs->idt.base;
-	set_idt(vcpu, &dt);
-	dt.limit = sregs->gdt.limit;
-	dt.base = sregs->gdt.base;
-	set_gdt(vcpu, &dt);
-
-	vcpu->cr2 = sregs->cr2;
-	mmu_reset_needed |= vcpu->cr3 != sregs->cr3;
-	vcpu->cr3 = sregs->cr3;
-	vcpu->cr8 = sregs->cr8;
-
-	mmu_reset_needed |= vcpu->shadow_efer != sregs->efer;
-
-	set_efer(vcpu, sregs->efer);
-
-	vcpu->apic_base = sregs->apic_base;
-
-	mmu_reset_needed |= vcpu->cr0 != sregs->cr0;
-	set_cr0_no_modeswitch(vcpu, sregs->cr0);
-
-	mmu_reset_needed |= vcpu->cr4 != sregs->cr4;
-	set_cr4(vcpu, sregs->cr4);
-
-	if (mmu_reset_needed)
-		vmrun_mmu_reset_context(vcpu);
-
-	memcpy(vcpu->irq_pending,
-	       sregs->interrupt_bitmap,
-	       sizeof vcpu->irq_pending);
-
-	vcpu->irq_summary = 0;
-
-	for (i = 0; i < NR_IRQ_WORDS; ++i)
-		if (vcpu->irq_pending[i])
-			__set_bit(i, &vcpu->irq_summary);
-
-	vcpu_put(vcpu);
-
-	return 0;
-}
-
-//static int vmrun_dev_open(struct inode *inode, struct file *filp)
-//{
-//	struct vmrun *vmrun = kzalloc(sizeof(struct vmrun), GFP_KERNEL);
-//	int i;
-//
-//	if (!vmrun)
-//		return -ENOMEM;
-//
-//	spin_lock_init(&vmrun->lock);
-//
-//	INIT_LIST_HEAD(&vmrun->active_mmu_pages);
-//
-//	for (i = 0; i < VMRUN_MAX_VCPUS; ++i) {
-//		struct vmrun_vcpu *vcpu = &vmrun->vcpus[i];
-//
-//		mutex_init(&vcpu->mutex);
-//		vcpu->mmu.root_hpa = INVALID_PAGE;
-//		INIT_LIST_HEAD(&vcpu->free_pages);
-//	}
-//
-//	filp->private_data = vmrun;
-//
-//	return 0;
-//}
-//
-//static int vmrun_dev_release(struct inode *inode, struct file *filp)
-//{
-//	struct vmrun *vmrun = filp->private_data;
-//
-//	vmrun_free_vcpus(vmrun);
-//	vmrun_free_physmem(vmrun);
-//	kfree(vmrun);
-//	return 0;
-//}
 
 /*
  * Insert memslot and re-sort memslots based on their GFN,
@@ -1385,7 +1663,7 @@ int __vmrun_set_memory_region(struct vmrun *vmrun,
 }
 
 int vmrun_set_memory_region(struct vmrun *vmrun,
-			  const struct vmrun_userspace_memory_region *mem)
+			    const struct vmrun_userspace_memory_region *mem)
 {
 	int r;
 
@@ -1396,7 +1674,7 @@ int vmrun_set_memory_region(struct vmrun *vmrun,
 }
 
 static int vmrun_vm_ioctl_set_memory_region(struct vmrun *vmrun,
-					  struct vmrun_userspace_memory_region *mem)
+					    struct vmrun_userspace_memory_region *mem)
 {
 	if ((u16)mem->slot >= VMRUN_USER_MEM_SLOTS)
 		return -EINVAL;
@@ -1478,17 +1756,6 @@ static inline bool vmrun_kick_many_cpus(const struct cpumask *cpus, bool wait)
 	smp_call_function_many(cpus, ack_flush, NULL, wait);
 
 	return true;
-}
-
-static inline struct vmrun_vcpu *vmrun_get_vcpu(struct vmrun *vmrun, int i)
-{
-	/* Pairs with smp_wmb() in vmrun_vm_ioctl_create_vcpu, in case
-	 * the caller has read vmrun->online_vcpus before (as is the case
-	 * for vmrun_for_each_vcpu, for example).
-	 */
-	smp_rmb();
-
-	return vmrun->vcpus[i];
 }
 
 static inline void vmrun_make_request(int req, struct vmrun_vcpu *vcpu)
@@ -2130,7 +2397,7 @@ static long vmrun_dev_ioctl(struct file *filp,
 			break;
 
 		default:
-			;
+			return -EINVAL;
 	}
 
 out:

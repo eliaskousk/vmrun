@@ -61,6 +61,8 @@
 #define MSR_VM_HSAVE_PA           0xc0010117
 
 #define HF_GIF_MASK		  (1 << 0)
+#define HF_GUEST_MASK		  (1 << 5) /* VCPU is in guest-mode */
+#define HF_SMM_MASK		  (1 << 6)
 #define V_INTR_MASK               (1 << 24)
 
 #define IOPM_ALLOC_ORDER          2
@@ -163,6 +165,17 @@ enum vmrun_reg {
 	NR_VCPU_REGS
 };
 
+enum {
+	VCPU_SREG_ES,
+	VCPU_SREG_CS,
+	VCPU_SREG_SS,
+	VCPU_SREG_DS,
+	VCPU_SREG_FS,
+	VCPU_SREG_GS,
+	VCPU_SREG_TR,
+	VCPU_SREG_LDTR,
+};
+
 struct system_table {
 	u16 limit;
 	u64 base;
@@ -225,11 +238,6 @@ struct vmrun_vcpu {
 
 	bool preempted;
 
-	unsigned long cr0;
-	u32 hflags;
-	u64 efer;
-
-	// SVM (Some are old)
 	struct vmcb *vmcb;
 	unsigned long vmcb_pa;
 	struct vmrun_cpu_data *cpu_data;
@@ -251,6 +259,16 @@ struct vmrun_vcpu {
 	unsigned long regs[NR_VCPU_REGS];
 	u32 regs_avail;
 	u32 regs_dirty;
+	unsigned long cr0;
+	unsigned long cr0_guest_owned_bits;
+	unsigned long cr2;
+	unsigned long cr3;
+	unsigned long cr4;
+	unsigned long cr4_guest_owned_bits;
+	unsigned long cr8;
+	u32 hflags;
+	u64 efer;
+
 	struct vmrun_mmu mmu;
 	struct list_head free_pages;
 };

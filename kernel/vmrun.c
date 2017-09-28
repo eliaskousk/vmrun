@@ -13,22 +13,22 @@
 // 1. AMD64 Architecture Programmer's Manual
 //    (Vol 2: System Programming)
 //
-// 2. VMRUN from the Linux kernel
+// 2. KVM from the Linux kernel
 //    (Mostly vmrun_main.c, mmu.c, x86.c svm.c)
 //
 // 3. Original Intel VT-x vmlaunch demo
 //    (https://github.com/vishmohan/vmlaunch)
 //
-// 4. Original vmrunsample demo
-//    (https://github.com/soulxu/vmrunsample)
+// 4. Original kvmsample demo
+//    (https://github.com/soulxu/kvmsample)
 //
 // Copyright (C) 2017: STROMASYS SA (http://www.stromasys.com)
 //
 // Authors:
 //
 // - Elias Kouskoumvekakis <eliask.kousk@stromasys.com>
-// - Avi Kivity            <avi@qumranet.com>   (VMRUN)
-// - Yaniv Kamay           <yaniv@qumranet.com> (VMRUN)
+// - Avi Kivity            <avi@qumranet.com>   (KVM)
+// - Yaniv Kamay           <yaniv@qumranet.com> (KVM)
 //
 // This work is licensed under the terms of the GNU GPL, version 2.
 // See the LICENSE file in the top-level directory.
@@ -97,6 +97,8 @@ struct kmem_cache *vmrun_vcpu_cache;
 static __read_mostly struct preempt_ops vmrun_preempt_ops;
 
 static unsigned long iopm_base;
+
+static bool npt_enabled = false;
 
 static DEFINE_PER_CPU(struct vmrun_vcpu *, local_vcpu);
 static DEFINE_PER_CPU(struct vmrun_cpu_data *, cpu_data);
@@ -245,11 +247,271 @@ static void vmrun_iopm_free(void)
 	printk("iopm_free: Freed I/O permission map");
 }
 
+static inline void vmrun_set_cr_intercept(struct vmrun_vcpu *vcpu, int bit)
+{
+	vcpu->vmcb->control.intercept_cr |= (1U << bit);
+	vcpu->vmcb->control.clean        &= ~(1 << VMCB_INTERCEPTS);
+}
+
+static inline void vmrun_clr_cr_intercept(struct vmrun_vcpu *vcpu, int bit)
+{
+	vcpu->vmcb->control.intercept_cr &= ~(1U << bit);
+	vcpu->vmcb->control.clean        &= ~(1 << VMCB_INTERCEPTS);
+}
+
+static inline bool vmrun_is_cr_intercept(struct vmrun_vcpu *vcpu, int bit)
+{
+	return vcpu->vmcb->control.intercept_cr & (1U << bit);
+}
+
+static void vmrun_update_cr0_intercept(struct vmrun_vcpu *vcpu)
+{
+	ulong gcr0 = vcpu->cr0;
+	u64 *hcr0  = &vcpu->vmcb->save.cr0;
+
+	*hcr0 = (*hcr0 & ~VMRUN_CR0_SELECTIVE_MASK)
+		| (gcr0 & VMRUN_CR0_SELECTIVE_MASK);
+
+	vcpu->vmcb->control.clean  &= ~(1 << VMCB_CR);
+
+	if (gcr0 == *hcr0) {
+		vmrun_clr_cr_intercept(vcpu, INTERCEPT_CR0_READ);
+		vmrun_clr_cr_intercept(vcpu, INTERCEPT_CR0_WRITE);
+	} else {
+		vmrun_set_cr_intercept(vcpu, INTERCEPT_CR0_READ);
+		vmrun_set_cr_intercept(vcpu, INTERCEPT_CR0_WRITE);
+	}
+}
+
+static void vmrun_set_cr0(struct vmrun_vcpu *vcpu, unsigned long cr0)
+{
+	if (vcpu->efer & EFER_LME) {
+		if (!likely(vmrun_read_cr0_bits(vcpu, X86_CR0_PG)) && (cr0 & X86_CR0_PG)) {
+			vcpu->efer |= EFER_LMA;
+			vcpu->vmcb->save.efer |= EFER_LMA | EFER_LME;
+		}
+
+		if (likely(vmrun_read_cr0_bits(vcpu, X86_CR0_PG)) && !(cr0 & X86_CR0_PG)) {
+			vcpu->efer &= ~EFER_LMA;
+			vcpu->vmcb->save.efer &= ~(EFER_LMA | EFER_LME);
+		}
+	}
+
+	vcpu->cr0 = cr0;
+
+	if (!npt_enabled)
+		cr0 |= X86_CR0_PG | X86_CR0_WP;
+
+	/*
+	 * re-enable caching here because the QEMU bios
+	 * does not do it - this results in some delay at
+	 * reboot
+	 */
+//	if (vmrun_check_has_quirk(vcpu->vmrun, VMRUN_X86_QUIRK_CD_NW_CLEARED))
+//		cr0 &= ~(X86_CR0_CD | X86_CR0_NW);
+
+	vcpu->vmcb->save.cr0        = cr0;
+	vcpu->vmcb->control.clean  &= ~(1 << VMCB_CR);
+
+	vmrun_update_cr0_intercept(vcpu);
+}
+
+static void vmrun_flush_tlb(struct vmrun_vcpu *vcpu)
+{
+	if (static_cpu_has(X86_FEATURE_FLUSHBYASID))
+		vcpu->vmcb->control.tlb_ctl = TLB_CONTROL_FLUSH_ASID;
+	else
+		vcpu->asid_generation--;
+}
+
+static int vmrun_set_cr4(struct vmrun_vcpu *vcpu, unsigned long cr4)
+{
+	unsigned long host_cr4_mce = cr4_read_shadow() & X86_CR4_MCE;
+	unsigned long old_cr4      = vcpu->vmcb->save.cr4;
+
+	if (cr4 & X86_CR4_VMXE)
+		return 1;
+
+	if (npt_enabled && ((old_cr4 ^ cr4) & X86_CR4_PGE))
+		vmrun_flush_tlb(vcpu);
+
+	vcpu->cr4 = cr4;
+
+	if (!npt_enabled)
+		cr4 |= X86_CR4_PAE;
+
+	cr4 |= host_cr4_mce;
+
+	vcpu->vmcb->save.cr4        = cr4;
+	vcpu->vmcb->control.clean  &= ~(1 << VMCB_CR);
+
+	return 0;
+}
+
+static struct vmcb_seg *vmrun_seg(struct vmrun_vcpu *vcpu, int seg)
+{
+	struct vmcb_save_area *save = &vcpu->vmcb->save;
+
+	switch (seg) {
+		case VCPU_SREG_CS:   return &save->cs;
+		case VCPU_SREG_DS:   return &save->ds;
+		case VCPU_SREG_ES:   return &save->es;
+		case VCPU_SREG_FS:   return &save->fs;
+		case VCPU_SREG_GS:   return &save->gs;
+		case VCPU_SREG_SS:   return &save->ss;
+		case VCPU_SREG_TR:   return &save->tr;
+		case VCPU_SREG_LDTR: return &save->ldtr;
+	}
+
+	BUG();
+
+	return NULL;
+}
+
+static u64 vmrun_get_segment_base(struct vmrun_vcpu *vcpu, int seg)
+{
+	struct vmcb_seg *s = vmrun_seg(vcpu, seg);
+
+	return s->base;
+}
+
+static void vmrun_get_segment(struct vmrun_vcpu *vcpu,
+			      struct vmrun_segment *var, int seg)
+{
+	struct vmcb_seg *s = vmrun_seg(vcpu, seg);
+
+	var->base     = s->base;
+	var->limit    = s->limit;
+	var->selector = s->selector;
+	var->type     = s->attrib   & VMRUN_SELECTOR_TYPE_MASK;
+	var->s        = (s->attrib >> VMRUN_SELECTOR_S_SHIFT)   & 1;
+	var->dpl      = (s->attrib >> VMRUN_SELECTOR_DPL_SHIFT) & 3;
+	var->present  = (s->attrib >> VMRUN_SELECTOR_P_SHIFT)   & 1;
+	var->avl      = (s->attrib >> VMRUN_SELECTOR_AVL_SHIFT) & 1;
+	var->l        = (s->attrib >> VMRUN_SELECTOR_L_SHIFT)   & 1;
+	var->db       = (s->attrib >> VMRUN_SELECTOR_DB_SHIFT)  & 1;
+
+	/*
+	 * AMD CPUs circa 2014 track the G bit for all segments except CS.
+	 * However, the SVM spec states that the G bit is not observed by the
+	 * CPU, and some VMware virtual CPUs drop the G bit for all segments.
+	 * So let's synthesize a legal G bit for all segments, this helps
+	 * running VMRUN nested. It also helps cross-vendor migration, because
+	 * Intel's vmentry has a check on the 'G' bit.
+	 */
+	var->g = s->limit > 0xfffff;
+
+	/*
+	 * AMD's VMCB does not have an explicit unusable field, so emulate it
+	 * for cross vendor migration purposes by "not present"
+	 */
+	var->unusable = !var->present;
+
+	switch (seg) {
+		case VCPU_SREG_TR:
+			/*
+			 * Work around a bug where the busy flag in the tr selector
+			 * isn't exposed
+			 */
+			var->type |= 0x2;
+			break;
+
+		case VCPU_SREG_DS:
+		case VCPU_SREG_ES:
+		case VCPU_SREG_FS:
+		case VCPU_SREG_GS:
+			/*
+			 * The accessed bit must always be set in the segment
+			 * descriptor cache, although it can be cleared in the
+			 * descriptor, the cached bit always remains at 1. Since
+			 * Intel has a check on this, set it here to support
+			 * cross-vendor migration.
+			 */
+			if (!var->unusable)
+				var->type |= 0x1;
+			break;
+
+		case VCPU_SREG_SS:
+			/*
+			 * On AMD CPUs sometimes the DB bit in the segment
+			 * descriptor is left as 1, although the whole segment has
+			 * been made unusable. Clear it here to pass an Intel VMX
+			 * entry check when cross vendor migrating.
+			 */
+			if (var->unusable)
+				var->db = 0;
+			/* This is symmetric with svm_set_segment() */
+			var->dpl = vcpu->vmcb->save.cpl;
+			break;
+	}
+}
+
+static void vmrun_set_segment(struct vmrun_vcpu *vcpu,
+			      struct vmrun_segment *var, int seg)
+{
+	struct vmcb_seg *s = vmrun_seg(vcpu, seg);
+
+	s->base     = var->base;
+	s->limit    = var->limit;
+	s->selector = var->selector;
+	s->attrib   = (var->type & VMRUN_SELECTOR_TYPE_MASK);
+	s->attrib  |= (var->s & 1) << VMRUN_SELECTOR_S_SHIFT;
+	s->attrib  |= (var->dpl & 3) << VMRUN_SELECTOR_DPL_SHIFT;
+	s->attrib  |= ((var->present & 1) && !var->unusable) << VMRUN_SELECTOR_P_SHIFT;
+	s->attrib  |= (var->avl & 1) << VMRUN_SELECTOR_AVL_SHIFT;
+	s->attrib  |= (var->l & 1) << VMRUN_SELECTOR_L_SHIFT;
+	s->attrib  |= (var->db & 1) << VMRUN_SELECTOR_DB_SHIFT;
+	s->attrib  |= (var->g & 1) << VMRUN_SELECTOR_G_SHIFT;
+
+	/*
+	 * This is always accurate, except if SYSRET returned to a segment
+	 * with SS.DPL != 3.  Intel does not have this quirk, and always
+	 * forces SS.DPL to 3 on sysret, so we ignore that case; fixing it
+	 * would entail passing the CPL to userspace and back.
+	 */
+	if (seg == VCPU_SREG_SS)
+		/* This is symmetric with svm_get_segment() */
+		vcpu->vmcb->save.cpl = (var->dpl & 3);
+
+	vcpu->vmcb->control.clean  &= ~(1 << VMCB_SEG);
+}
+
+static int vmrun_get_cpl(struct vmrun_vcpu *vcpu)
+{
+	return vcpu->vmcb->save.cpl;
+}
+
+static void vmrun_get_idt(struct vmrun_vcpu *vcpu, struct desc_ptr *dt)
+{
+	dt->size    = vcpu->vmcb->save.idtr.limit;
+	dt->address = vcpu->vmcb->save.idtr.base;
+}
+
+static void vmrun_set_idt(struct vmrun_vcpu *vcpu, struct desc_ptr *dt)
+{
+	vcpu->vmcb->save.idtr.limit = dt->size;
+	vcpu->vmcb->save.idtr.base  = dt->address ;
+	vcpu->vmcb->control.clean  &= ~(1 << VMCB_DT);
+}
+
+static void vmrun_get_gdt(struct vmrun_vcpu *vcpu, struct desc_ptr *dt)
+{
+	dt->size    = vcpu->vmcb->save.gdtr.limit;
+	dt->address = vcpu->vmcb->save.gdtr.base;
+}
+
+static void vmrun_set_gdt(struct vmrun_vcpu *vcpu, struct desc_ptr *dt)
+{
+	vcpu->vmcb->save.gdtr.limit = dt->size;
+	vcpu->vmcb->save.gdtr.base  = dt->address ;
+	vcpu->vmcb->control.clean  &= ~(1 << VMCB_DT);
+}
+
 static void vmrun_init_seg(struct vmcb_seg *seg)
 {
 	seg->selector = 0;
-	seg->attrib = SVM_SELECTOR_P_MASK | SVM_SELECTOR_S_MASK |
-		      SVM_SELECTOR_WRITE_MASK; /* Read/Write Data Segment */
+	seg->attrib = VMRUN_SELECTOR_P_MASK | VMRUN_SELECTOR_S_MASK |
+		      VMRUN_SELECTOR_WRITE_MASK; /* Read/Write Data Segment */
 	seg->limit = 0xffff;
 	seg->base = 0;
 }
@@ -257,7 +519,7 @@ static void vmrun_init_seg(struct vmcb_seg *seg)
 static void vmrun_init_sys_seg(struct vmcb_seg *seg, uint32_t type)
 {
 	seg->selector = 0;
-	seg->attrib = SVM_SELECTOR_P_MASK | type;
+	seg->attrib = VMRUN_SELECTOR_P_MASK | type;
 	seg->limit = 0xffff;
 	seg->base = 0;
 }
@@ -288,8 +550,8 @@ static void vmrun_vmcb_init(struct vmrun_vcpu *vcpu)
 	save->cs.selector = 0xf000;
 	save->cs.base = 0xffff0000;
 	/* Executable/Readable Code Segment */
-	save->cs.attrib = SVM_SELECTOR_READ_MASK | SVM_SELECTOR_P_MASK |
-			  SVM_SELECTOR_S_MASK | SVM_SELECTOR_CODE_MASK;
+	save->cs.attrib = VMRUN_SELECTOR_READ_MASK | VMRUN_SELECTOR_P_MASK |
+			  VMRUN_SELECTOR_S_MASK | VMRUN_SELECTOR_CODE_MASK;
 	save->cs.limit = 0xffff;
 
 	save->gdtr.limit = 0xffff;
@@ -314,7 +576,8 @@ static void vmrun_vmcb_init(struct vmrun_vcpu *vcpu)
 	vcpu->regs[VCPU_REGS_RIP] = save->rip;
 
 	vmrun_mmu_reset_context(vcpu);
-	vmrun_make_request(VMRUN_REQ_EVENT, vcpu); // Needed?
+	
+	// vmrun_make_request(VMRUN_REQ_EVENT, vcpu); // Needed?
 }
 
 static void vmrun_vcpu_setup_old(struct vmrun_vcpu *vcpu)
@@ -417,7 +680,7 @@ static void vmrun_vcpu_setup_old(struct vmrun_vcpu *vcpu)
 	vcpu->vmcb->control.clean = 0;
 }
 
-static void vmrun_vcpu_run(struct vmrun_vcpu *vcpu)
+static void vmrun_vcpu_run_old(struct vmrun_vcpu *vcpu)
 {
 	int cpu = 0;
 	struct vmrun_cpu_data *cd = NULL;
@@ -540,6 +803,175 @@ static void vmrun_vcpu_run(struct vmrun_vcpu *vcpu)
 	put_cpu();
 }
 
+static void vmrun_vcpu_run(struct vmrun_vcpu *vcpu)
+{
+	struct vcpu_svm *svm = to_svm(vcpu);
+
+	svm->vmcb->save.rax = vcpu->arch.regs[VCPU_REGS_RAX];
+	svm->vmcb->save.rsp = vcpu->arch.regs[VCPU_REGS_RSP];
+	svm->vmcb->save.rip = vcpu->arch.regs[VCPU_REGS_RIP];
+
+	/*
+	 * A vmexit emulation is required before the vcpu can be executed
+	 * again.
+	 */
+	if (unlikely(svm->nested.exit_required))
+		return;
+
+	/*
+	 * Disable singlestep if we're injecting an interrupt/exception.
+	 * We don't want our modified rflags to be pushed on the stack where
+	 * we might not be able to easily reset them if we disabled NMI
+	 * singlestep later.
+	 */
+	if (svm->nmi_singlestep && svm->vmcb->control.event_inj) {
+		/*
+		 * Event injection happens before external interrupts cause a
+		 * vmexit and interrupts are disabled here, so smp_send_reschedule
+		 * is enough to force an immediate vmexit.
+		 */
+		disable_nmi_singlestep(svm);
+		smp_send_reschedule(vcpu->cpu);
+	}
+
+	pre_svm_run(svm);
+
+	sync_lapic_to_cr8(vcpu);
+
+	svm->vmcb->save.cr2 = vcpu->arch.cr2;
+
+	clgi();
+
+	local_irq_enable();
+
+	asm volatile (
+	"push %%" _ASM_BP "; \n\t"
+		"mov %c[rbx](%[svm]), %%" _ASM_BX " \n\t"
+		"mov %c[rcx](%[svm]), %%" _ASM_CX " \n\t"
+		"mov %c[rdx](%[svm]), %%" _ASM_DX " \n\t"
+		"mov %c[rsi](%[svm]), %%" _ASM_SI " \n\t"
+		"mov %c[rdi](%[svm]), %%" _ASM_DI " \n\t"
+		"mov %c[rbp](%[svm]), %%" _ASM_BP " \n\t"
+#ifdef CONFIG_X86_64
+		"mov %c[r8](%[svm]),  %%r8  \n\t"
+		"mov %c[r9](%[svm]),  %%r9  \n\t"
+		"mov %c[r10](%[svm]), %%r10 \n\t"
+		"mov %c[r11](%[svm]), %%r11 \n\t"
+		"mov %c[r12](%[svm]), %%r12 \n\t"
+		"mov %c[r13](%[svm]), %%r13 \n\t"
+		"mov %c[r14](%[svm]), %%r14 \n\t"
+		"mov %c[r15](%[svm]), %%r15 \n\t"
+#endif
+
+		/* Enter guest mode */
+		"push %%" _ASM_AX " \n\t"
+		"mov %c[vmcb](%[svm]), %%" _ASM_AX " \n\t"
+	__ex(SVM_VMLOAD) "\n\t"
+	__ex(SVM_VMRUN) "\n\t"
+	__ex(SVM_VMSAVE) "\n\t"
+		"pop %%" _ASM_AX " \n\t"
+
+		/* Save guest registers, load host registers */
+		"mov %%" _ASM_BX ", %c[rbx](%[svm]) \n\t"
+		"mov %%" _ASM_CX ", %c[rcx](%[svm]) \n\t"
+		"mov %%" _ASM_DX ", %c[rdx](%[svm]) \n\t"
+		"mov %%" _ASM_SI ", %c[rsi](%[svm]) \n\t"
+		"mov %%" _ASM_DI ", %c[rdi](%[svm]) \n\t"
+		"mov %%" _ASM_BP ", %c[rbp](%[svm]) \n\t"
+#ifdef CONFIG_X86_64
+		"mov %%r8,  %c[r8](%[svm]) \n\t"
+		"mov %%r9,  %c[r9](%[svm]) \n\t"
+		"mov %%r10, %c[r10](%[svm]) \n\t"
+		"mov %%r11, %c[r11](%[svm]) \n\t"
+		"mov %%r12, %c[r12](%[svm]) \n\t"
+		"mov %%r13, %c[r13](%[svm]) \n\t"
+		"mov %%r14, %c[r14](%[svm]) \n\t"
+		"mov %%r15, %c[r15](%[svm]) \n\t"
+#endif
+		"pop %%" _ASM_BP
+	:
+	: [svm]"a"(svm),
+	[vmcb]"i"(offsetof(struct vcpu_svm, vmcb_pa)),
+	[rbx]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_RBX])),
+	[rcx]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_RCX])),
+	[rdx]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_RDX])),
+	[rsi]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_RSI])),
+	[rdi]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_RDI])),
+	[rbp]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_RBP]))
+#ifdef CONFIG_X86_64
+		, [r8]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_R8])),
+	[r9]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_R9])),
+	[r10]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_R10])),
+	[r11]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_R11])),
+	[r12]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_R12])),
+	[r13]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_R13])),
+	[r14]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_R14])),
+	[r15]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_R15]))
+#endif
+	: "cc", "memory"
+#ifdef CONFIG_X86_64
+		, "rbx", "rcx", "rdx", "rsi", "rdi"
+		, "r8", "r9", "r10", "r11" , "r12", "r13", "r14", "r15"
+#else
+	, "ebx", "ecx", "edx", "esi", "edi"
+#endif
+	);
+
+#ifdef CONFIG_X86_64
+	wrmsrl(MSR_GS_BASE, svm->host.gs_base);
+#else
+	loadsegment(fs, svm->host.fs);
+#ifndef CONFIG_X86_32_LAZY_GS
+	loadsegment(gs, svm->host.gs);
+#endif
+#endif
+
+	reload_tss(vcpu);
+
+	local_irq_disable();
+
+	vcpu->arch.cr2 = svm->vmcb->save.cr2;
+	vcpu->arch.regs[VCPU_REGS_RAX] = svm->vmcb->save.rax;
+	vcpu->arch.regs[VCPU_REGS_RSP] = svm->vmcb->save.rsp;
+	vcpu->arch.regs[VCPU_REGS_RIP] = svm->vmcb->save.rip;
+
+	if (unlikely(svm->vmcb->control.exit_code == SVM_EXIT_NMI))
+		vmrun_before_handle_nmi(&svm->vcpu);
+
+	stgi();
+
+	/* Any pending NMI will happen here */
+
+	if (unlikely(svm->vmcb->control.exit_code == SVM_EXIT_NMI))
+		vmrun_after_handle_nmi(&svm->vcpu);
+
+	sync_cr8_to_lapic(vcpu);
+
+	svm->next_rip = 0;
+
+	svm->vmcb->control.tlb_ctl = TLB_CONTROL_DO_NOTHING;
+
+	/* if exit due to PF check for async PF */
+	if (svm->vmcb->control.exit_code == SVM_EXIT_EXCP_BASE + PF_VECTOR)
+		svm->vcpu.arch.apf.host_apf_reason = vmrun_read_and_reset_pf_reason();
+
+	if (npt_enabled) {
+		vcpu->arch.regs_avail &= ~(1 << VCPU_EXREG_PDPTR);
+		vcpu->arch.regs_dirty &= ~(1 << VCPU_EXREG_PDPTR);
+	}
+
+	/*
+	 * We need to handle MC intercepts here before the vcpu has a chance to
+	 * change the physical cpu
+	 */
+	if (unlikely(svm->vmcb->control.exit_code ==
+		     SVM_EXIT_EXCP_BASE + MC_VECTOR))
+		svm_handle_mce(svm);
+
+	mark_all_clean(svm->vmcb);
+}
+// STACK_FRAME_NON_STANDARD(vmrun_vcpu_run);
+
 static inline struct vmrun_vcpu *vmrun_get_vcpu(struct vmrun *vmrun, int i)
 {
 	/* Pairs with smp_wmb() in vmrun_vm_ioctl_create_vcpu, in case
@@ -637,16 +1069,6 @@ bool vmrun_vcpu_wake_up(struct vmrun_vcpu *vcpu)
 	}
 
 	return false;
-}
-
-bool vmrun_vcpu_is_reset_bsp(struct vmrun_vcpu *vcpu)
-{
-	return vcpu->vmrun->arch.bsp_vcpu_id == vcpu->vcpu_id;
-}
-
-bool vmrun_vcpu_is_bsp(struct vmrun_vcpu *vcpu)
-{
-	return (vcpu->arch.apic_base & MSR_IA32_APICBASE_BSP) != 0;
 }
 
 int vmrun_vcpu_init(struct vmrun_vcpu *vcpu, struct vmrun *vmrun, unsigned id)
@@ -807,8 +1229,8 @@ static void vmrun_free_vcpus(struct vmrun *vmrun)
 void vmrun_vcpu_reset(struct vmrun_vcpu *vcpu, bool init_event)
 {
 	vcpu->hflags = 0;
+	vcpu->cr2    = 0;
 
-	// vcpu->cr2 = 0;
 	//vmrun_make_request(VMRUN_REQ_EVENT, vcpu);
 
 	memset(vcpu->regs, 0, sizeof(vcpu->regs));
@@ -858,77 +1280,376 @@ void vmrun_vcpu_destroy(struct vmrun_vcpu *vcpu)
 	vmrun_vcpu_free(vcpu);
 }
 
+/*
+ * Returns 1 to let vcpu_run() continue the guest execution loop without
+ * exiting to the userspace.  Otherwise, the value will be returned to the
+ * userspace.
+ */
+static int vmrun_vcpu_enter_guest(struct vmrun_vcpu *vcpu)
+{
+	int r;
+	bool req_int_win =
+		dm_request_for_irq_injection(vcpu) &&
+		vmrun_cpu_accept_dm_intr(vcpu);
+
+	bool req_immediate_exit = false;
+
+	if (vmrun_request_pending(vcpu)) {
+		if (vmrun_check_request(VMRUN_REQ_MMU_RELOAD, vcpu))
+			vmrun_mmu_unload(vcpu);
+		if (vmrun_check_request(VMRUN_REQ_MIGRATE_TIMER, vcpu))
+			__vmrun_migrate_timers(vcpu);
+		if (vmrun_check_request(VMRUN_REQ_MASTERCLOCK_UPDATE, vcpu))
+			vmrun_gen_update_masterclock(vcpu->vmrun);
+		if (vmrun_check_request(VMRUN_REQ_GLOBAL_CLOCK_UPDATE, vcpu))
+			vmrun_gen_vmrunclock_update(vcpu);
+		if (vmrun_check_request(VMRUN_REQ_CLOCK_UPDATE, vcpu)) {
+			r = vmrun_guest_time_update(vcpu);
+			if (unlikely(r))
+				goto out;
+		}
+		if (vmrun_check_request(VMRUN_REQ_MMU_SYNC, vcpu))
+			vmrun_mmu_sync_roots(vcpu);
+		if (vmrun_check_request(VMRUN_REQ_TLB_FLUSH, vcpu))
+			vmrun_vcpu_flush_tlb(vcpu);
+		if (vmrun_check_request(VMRUN_REQ_REPORT_TPR_ACCESS, vcpu)) {
+			vcpu->run->exit_reason = VMRUN_EXIT_TPR_ACCESS;
+			r = 0;
+			goto out;
+		}
+		if (vmrun_check_request(VMRUN_REQ_TRIPLE_FAULT, vcpu)) {
+			vcpu->run->exit_reason = VMRUN_EXIT_SHUTDOWN;
+			vcpu->mmio_needed = 0;
+			r = 0;
+			goto out;
+		}
+		if (vmrun_check_request(VMRUN_REQ_APF_HALT, vcpu)) {
+			/* Page is swapped out. Do synthetic halt */
+			vcpu->arch.apf.halted = true;
+			r = 1;
+			goto out;
+		}
+		if (vmrun_check_request(VMRUN_REQ_STEAL_UPDATE, vcpu))
+			record_steal_time(vcpu);
+		if (vmrun_check_request(VMRUN_REQ_SMI, vcpu))
+			process_smi(vcpu);
+		if (vmrun_check_request(VMRUN_REQ_NMI, vcpu))
+			process_nmi(vcpu);
+		if (vmrun_check_request(VMRUN_REQ_PMU, vcpu))
+			vmrun_pmu_handle_event(vcpu);
+		if (vmrun_check_request(VMRUN_REQ_PMI, vcpu))
+			vmrun_pmu_deliver_pmi(vcpu);
+		if (vmrun_check_request(VMRUN_REQ_IOAPIC_EOI_EXIT, vcpu)) {
+			BUG_ON(vcpu->arch.pending_ioapic_eoi > 255);
+			if (test_bit(vcpu->arch.pending_ioapic_eoi,
+				     vcpu->arch.ioapic_handled_vectors)) {
+				vcpu->run->exit_reason = VMRUN_EXIT_IOAPIC_EOI;
+				vcpu->run->eoi.vector =
+					vcpu->arch.pending_ioapic_eoi;
+				r = 0;
+				goto out;
+			}
+		}
+		if (vmrun_check_request(VMRUN_REQ_SCAN_IOAPIC, vcpu))
+			vcpu_scan_ioapic(vcpu);
+		if (vmrun_check_request(VMRUN_REQ_APIC_PAGE_RELOAD, vcpu))
+			vmrun_vcpu_reload_apic_access_page(vcpu);
+		if (vmrun_check_request(VMRUN_REQ_HV_CRASH, vcpu)) {
+			vcpu->run->exit_reason = VMRUN_EXIT_SYSTEM_EVENT;
+			vcpu->run->system_event.type = VMRUN_SYSTEM_EVENT_CRASH;
+			r = 0;
+			goto out;
+		}
+		if (vmrun_check_request(VMRUN_REQ_HV_RESET, vcpu)) {
+			vcpu->run->exit_reason = VMRUN_EXIT_SYSTEM_EVENT;
+			vcpu->run->system_event.type = VMRUN_SYSTEM_EVENT_RESET;
+			r = 0;
+			goto out;
+		}
+		if (vmrun_check_request(VMRUN_REQ_HV_EXIT, vcpu)) {
+			vcpu->run->exit_reason = VMRUN_EXIT_HYPERV;
+			vcpu->run->hyperv = vcpu->arch.hyperv.exit;
+			r = 0;
+			goto out;
+		}
+
+		/*
+		 * VMRUN_REQ_HV_STIMER has to be processed after
+		 * VMRUN_REQ_CLOCK_UPDATE, because Hyper-V SynIC timers
+		 * depend on the guest clock being up-to-date
+		 */
+		if (vmrun_check_request(VMRUN_REQ_HV_STIMER, vcpu))
+			vmrun_hv_process_stimers(vcpu);
+	}
+
+	if (vmrun_check_request(VMRUN_REQ_EVENT, vcpu) || req_int_win) {
+		++vcpu->stat.req_event;
+		vmrun_apic_accept_events(vcpu);
+		if (vcpu->arch.mp_state == VMRUN_MP_STATE_INIT_RECEIVED) {
+			r = 1;
+			goto out;
+		}
+
+		if (inject_pending_event(vcpu, req_int_win) != 0)
+			req_immediate_exit = true;
+		else {
+			/* Enable NMI/IRQ window open exits if needed.
+			 *
+			 * SMIs have two cases: 1) they can be nested, and
+			 * then there is nothing to do here because RSM will
+			 * cause a vmexit anyway; 2) or the SMI can be pending
+			 * because inject_pending_event has completed the
+			 * injection of an IRQ or NMI from the previous vmexit,
+			 * and then we request an immediate exit to inject the SMI.
+			 */
+			if (vcpu->arch.smi_pending && !is_smm(vcpu))
+				req_immediate_exit = true;
+			if (vcpu->arch.nmi_pending)
+				vmrun_x86_ops->enable_nmi_window(vcpu);
+			if (vmrun_cpu_has_injectable_intr(vcpu) || req_int_win)
+				vmrun_x86_ops->enable_irq_window(vcpu);
+			WARN_ON(vcpu->arch.exception.pending);
+		}
+
+		if (vmrun_lapic_enabled(vcpu)) {
+			update_cr8_intercept(vcpu);
+			vmrun_lapic_sync_to_vapic(vcpu);
+		}
+	}
+
+	r = vmrun_mmu_reload(vcpu);
+	if (unlikely(r)) {
+		goto cancel_injection;
+	}
+
+	preempt_disable();
+
+	vmrun_x86_ops->prepare_guest_switch(vcpu);
+	vmrun_load_guest_fpu(vcpu);
+
+	/*
+	 * Disable IRQs before setting IN_GUEST_MODE.  Posted interrupt
+	 * IPI are then delayed after guest entry, which ensures that they
+	 * result in virtual interrupt delivery.
+	 */
+	local_irq_disable();
+	vcpu->mode = IN_GUEST_MODE;
+
+	srcu_read_unlock(&vcpu->vmrun->srcu, vcpu->srcu_idx);
+
+	/*
+	 * 1) We should set ->mode before checking ->requests.  Please see
+	 * the comment in vmrun_vcpu_exiting_guest_mode().
+	 *
+	 * 2) For APICv, we should set ->mode before checking PIR.ON.  This
+	 * pairs with the memory barrier implicit in pi_test_and_set_on
+	 * (see vmx_deliver_posted_interrupt).
+	 *
+	 * 3) This also orders the write to mode from any reads to the page
+	 * tables done while the VCPU is running.  Please see the comment
+	 * in vmrun_flush_remote_tlbs.
+	 */
+	smp_mb__after_srcu_read_unlock();
+
+	/*
+	 * This handles the case where a posted interrupt was
+	 * notified with vmrun_vcpu_kick.
+	 */
+	if (vmrun_lapic_enabled(vcpu)) {
+		if (vmrun_x86_ops->sync_pir_to_irr && vcpu->arch.apicv_active)
+			vmrun_x86_ops->sync_pir_to_irr(vcpu);
+	}
+
+	if (vcpu->mode == EXITING_GUEST_MODE || vmrun_request_pending(vcpu)
+	    || need_resched() || signal_pending(current)) {
+		vcpu->mode = OUTSIDE_GUEST_MODE;
+		smp_wmb();
+		local_irq_enable();
+		preempt_enable();
+		vcpu->srcu_idx = srcu_read_lock(&vcpu->vmrun->srcu);
+		r = 1;
+		goto cancel_injection;
+	}
+
+	vmrun_load_guest_xcr0(vcpu);
+
+	if (req_immediate_exit) {
+		vmrun_make_request(VMRUN_REQ_EVENT, vcpu);
+		smp_send_reschedule(vcpu->cpu);
+	}
+
+	trace_vmrun_entry(vcpu->vcpu_id);
+	wait_lapic_expire(vcpu);
+	guest_enter_irqoff();
+
+	if (unlikely(vcpu->arch.switch_db_regs)) {
+		set_debugreg(0, 7);
+		set_debugreg(vcpu->arch.eff_db[0], 0);
+		set_debugreg(vcpu->arch.eff_db[1], 1);
+		set_debugreg(vcpu->arch.eff_db[2], 2);
+		set_debugreg(vcpu->arch.eff_db[3], 3);
+		set_debugreg(vcpu->arch.dr6, 6);
+		vcpu->arch.switch_db_regs &= ~VMRUN_DEBUGREG_RELOAD;
+	}
+
+	vmrun_vcpu_run(vcpu);
+
+	/*
+	 * Do this here before restoring debug registers on the host.  And
+	 * since we do this before handling the vmexit, a DR access vmexit
+	 * can (a) read the correct value of the debug registers, (b) set
+	 * VMRUN_DEBUGREG_WONT_EXIT again.
+	 */
+	if (unlikely(vcpu->arch.switch_db_regs & VMRUN_DEBUGREG_WONT_EXIT)) {
+		WARN_ON(vcpu->guest_debug & VMRUN_GUESTDBG_USE_HW_BP);
+		vmrun_x86_ops->sync_dirty_debug_regs(vcpu);
+		vmrun_update_dr0123(vcpu);
+		vmrun_update_dr6(vcpu);
+		vmrun_update_dr7(vcpu);
+		vcpu->arch.switch_db_regs &= ~VMRUN_DEBUGREG_RELOAD;
+	}
+
+	/*
+	 * If the guest has used debug registers, at least dr7
+	 * will be disabled while returning to the host.
+	 * If we don't have active breakpoints in the host, we don't
+	 * care about the messed up debug address registers. But if
+	 * we have some of them active, restore the old state.
+	 */
+	if (hw_breakpoint_active())
+		hw_breakpoint_restore();
+
+	vcpu->arch.last_guest_tsc = vmrun_read_l1_tsc(vcpu, rdtsc());
+
+	vcpu->mode = OUTSIDE_GUEST_MODE;
+	smp_wmb();
+
+	vmrun_put_guest_xcr0(vcpu);
+
+	vmrun_x86_ops->handle_external_intr(vcpu);
+
+	++vcpu->stat.exits;
+
+	guest_exit_irqoff();
+
+	local_irq_enable();
+	preempt_enable();
+
+	vcpu->srcu_idx = srcu_read_lock(&vcpu->vmrun->srcu);
+
+	/*
+	 * Profile VMRUN exit RIPs:
+	 */
+	if (unlikely(prof_on == VMRUN_PROFILING)) {
+		unsigned long rip = vmrun_rip_read(vcpu);
+		profile_hit(VMRUN_PROFILING, (void *)rip);
+	}
+
+	if (unlikely(vcpu->arch.tsc_always_catchup))
+		vmrun_make_request(VMRUN_REQ_CLOCK_UPDATE, vcpu);
+
+	if (vcpu->arch.apic_attention)
+		vmrun_lapic_sync_from_vapic(vcpu);
+
+	vcpu->arch.gpa_available = false;
+	r = vmrun_x86_ops->handle_exit(vcpu);
+	return r;
+
+cancel_injection:
+	vmrun_x86_ops->cancel_injection(vcpu);
+	if (unlikely(vcpu->arch.apic_attention))
+		vmrun_lapic_sync_from_vapic(vcpu);
+	
+out:
+	return r;
+}
+
+static inline int vmrun_vcpu_block(struct vmrun *vmrun, struct vmrun_vcpu *vcpu)
+{
+	if (vcpu->mp_state != VMRUN_MP_STATE_RUNNABLE)
+	{
+		srcu_read_unlock(&vmrun->srcu, vcpu->srcu_idx);
+		
+		// vmrun_vcpu_block(vcpu);
+		
+		vcpu->srcu_idx = srcu_read_lock(&vmrun->srcu);
+
+//		if (!vmrun_check_request(VMRUN_REQ_UNHALT, vcpu))
+//			return 1;
+	}
+	
+	switch(vcpu->mp_state) {
+		case VMRUN_MP_STATE_HALTED:
+			vcpu->mp_state = VMRUN_MP_STATE_RUNNABLE;
+		case VMRUN_MP_STATE_RUNNABLE:
+			break;
+		case VMRUN_MP_STATE_INIT_RECEIVED:
+			break;
+		default:
+			return -EINTR;
+			break;
+	}
+	
+	return 1;
+}
+
+static int vmrun_vcpu_run(struct vmrun_vcpu *vcpu)
+{
+	int r;
+	struct vmrun *vmrun = vcpu->vmrun;
+
+	vcpu->srcu_idx = srcu_read_lock(&vmrun->srcu);
+
+	for (;;) {
+		if (vcpu->mp_state == VMRUN_MP_STATE_RUNNABLE) {
+			r = vmrun_vcpu_enter_guest(vcpu);
+		} else {
+			r = -EINVAL;
+			// r = vmrun_vcpu_block(vmrun, vcpu);
+		}
+
+		if (r <= 0)
+			break;
+
+//		if (signal_pending(current)) {
+//			r = -EINTR;
+//			vcpu->run->exit_reason = VMRUN_EXIT_INTR;
+//			++vcpu->stat.signal_exits;
+//			break;
+//		}
+		
+		if (need_resched()) {
+			srcu_read_unlock(&vmrun->srcu, vcpu->srcu_idx);
+			cond_resched();
+			vcpu->srcu_idx = srcu_read_lock(&vmrun->srcu);
+		}
+	}
+
+	srcu_read_unlock(&vmrun->srcu, vcpu->srcu_idx);
+
+	return r;
+}
+
 int vmrun_vcpu_ioctl_run(struct vmrun_vcpu *vcpu, struct vmrun_run *vmrun_run)
 {
-	struct fpu *fpu = &current->thread.fpu;
 	int r;
-	sigset_t sigsaved;
 
-	fpu__activate_curr(fpu);
-
-	if (vcpu->sigset_active)
-		sigprocmask(SIG_SETMASK, &vcpu->sigset, &sigsaved);
-
-	if (unlikely(vcpu->arch.mp_state == VMRUN_MP_STATE_UNINITIALIZED)) {
-		if (vmrun_run->immediate_exit) {
-			r = -EINTR;
-			goto out;
-		}
-		vmrun_vcpu_block(vcpu);
-		vmrun_apic_accept_events(vcpu);
-		vmrun_clear_request(VMRUN_REQ_UNHALT, vcpu);
-		r = -EAGAIN;
-		if (signal_pending(current)) {
-			r = -EINTR;
-			vcpu->run->exit_reason = VMRUN_EXIT_INTR;
-			++vcpu->stat.signal_exits;
-		}
-		goto out;
-	}
-
-	/* re-sync apic's tpr */
-	if (!lapic_in_kernel(vcpu)) {
-		if (vmrun_set_cr8(vcpu, vmrun_run->cr8) != 0) {
-			r = -EINVAL;
-			goto out;
-		}
-	}
-
-	if (unlikely(vcpu->arch.complete_userspace_io)) {
-		int (*cui)(struct vmrun_vcpu *) = vcpu->arch.complete_userspace_io;
-		vcpu->arch.complete_userspace_io = NULL;
-		r = cui(vcpu);
-		if (r <= 0)
-			goto out;
-	} else
-		WARN_ON(vcpu->arch.pio.count || vcpu->mmio_needed);
+//	if (vcpu->sigset_active)
+//		sigprocmask(SIG_SETMASK, &vcpu->sigset, &sigsaved);
 
 	if (vmrun_run->immediate_exit)
 		r = -EINTR;
 	else
-		r = vcpu_run(vcpu);
+		r = vmrun_vcpu_run(vcpu);
 
-	out:
-	post_vmrun_run_save(vcpu);
-	if (vcpu->sigset_active)
-		sigprocmask(SIG_SETMASK, &sigsaved, NULL);
+out:
+	// vmrun_post_vmrun_run_save(vcpu);
 
 	return r;
 }
 
 int vmrun_vcpu_ioctl_get_regs(struct vmrun_vcpu *vcpu, struct vmrun_regs *regs)
 {
-	if (vcpu->arch.emulate_regs_need_sync_to_vcpu) {
-		/*
-		 * We are here if userspace calls get_regs() in the middle of
-		 * instruction emulation. Registers state needs to be copied
-		 * back from emulation context to vcpu. Userspace shouldn't do
-		 * that usually, but some bad designed PV devices (vmware
-		 * backdoor interface) need this to work
-		 */
-		emulator_writeback_register_cache(&vcpu->arch.emulate_ctxt);
-		vcpu->arch.emulate_regs_need_sync_to_vcpu = false;
-	}
 	regs->rax = vmrun_register_read(vcpu, VCPU_REGS_RAX);
 	regs->rbx = vmrun_register_read(vcpu, VCPU_REGS_RBX);
 	regs->rcx = vmrun_register_read(vcpu, VCPU_REGS_RCX);
@@ -937,28 +1658,22 @@ int vmrun_vcpu_ioctl_get_regs(struct vmrun_vcpu *vcpu, struct vmrun_regs *regs)
 	regs->rdi = vmrun_register_read(vcpu, VCPU_REGS_RDI);
 	regs->rsp = vmrun_register_read(vcpu, VCPU_REGS_RSP);
 	regs->rbp = vmrun_register_read(vcpu, VCPU_REGS_RBP);
-#ifdef CONFIG_X86_64
-	regs->r8 = vmrun_register_read(vcpu, VCPU_REGS_R8);
-	regs->r9 = vmrun_register_read(vcpu, VCPU_REGS_R9);
+	regs->r8  = vmrun_register_read(vcpu, VCPU_REGS_R8);
+	regs->r9  = vmrun_register_read(vcpu, VCPU_REGS_R9);
 	regs->r10 = vmrun_register_read(vcpu, VCPU_REGS_R10);
 	regs->r11 = vmrun_register_read(vcpu, VCPU_REGS_R11);
 	regs->r12 = vmrun_register_read(vcpu, VCPU_REGS_R12);
 	regs->r13 = vmrun_register_read(vcpu, VCPU_REGS_R13);
 	regs->r14 = vmrun_register_read(vcpu, VCPU_REGS_R14);
 	regs->r15 = vmrun_register_read(vcpu, VCPU_REGS_R15);
-#endif
-
-	regs->rip = vmrun_rip_read(vcpu);
-	regs->rflags = vmrun_get_rflags(vcpu);
+	regs->rip = vmrun_register_read(vcpu, VCPU_REGS_RIP);
+	regs->rflags = vcpu->vmcb->save.rflags;
 
 	return 0;
 }
 
 int vmrun_vcpu_ioctl_set_regs(struct vmrun_vcpu *vcpu, struct vmrun_regs *regs)
 {
-	vcpu->arch.emulate_regs_need_sync_from_vcpu = true;
-	vcpu->arch.emulate_regs_need_sync_to_vcpu = false;
-
 	vmrun_register_write(vcpu, VCPU_REGS_RAX, regs->rax);
 	vmrun_register_write(vcpu, VCPU_REGS_RBX, regs->rbx);
 	vmrun_register_write(vcpu, VCPU_REGS_RCX, regs->rcx);
@@ -967,23 +1682,20 @@ int vmrun_vcpu_ioctl_set_regs(struct vmrun_vcpu *vcpu, struct vmrun_regs *regs)
 	vmrun_register_write(vcpu, VCPU_REGS_RDI, regs->rdi);
 	vmrun_register_write(vcpu, VCPU_REGS_RSP, regs->rsp);
 	vmrun_register_write(vcpu, VCPU_REGS_RBP, regs->rbp);
-#ifdef CONFIG_X86_64
-	vmrun_register_write(vcpu, VCPU_REGS_R8, regs->r8);
-	vmrun_register_write(vcpu, VCPU_REGS_R9, regs->r9);
+	vmrun_register_write(vcpu, VCPU_REGS_R8,  regs->r8);
+	vmrun_register_write(vcpu, VCPU_REGS_R9,  regs->r9);
 	vmrun_register_write(vcpu, VCPU_REGS_R10, regs->r10);
 	vmrun_register_write(vcpu, VCPU_REGS_R11, regs->r11);
 	vmrun_register_write(vcpu, VCPU_REGS_R12, regs->r12);
 	vmrun_register_write(vcpu, VCPU_REGS_R13, regs->r13);
 	vmrun_register_write(vcpu, VCPU_REGS_R14, regs->r14);
 	vmrun_register_write(vcpu, VCPU_REGS_R15, regs->r15);
-#endif
+	vmrun_register_write(vcpu, VCPU_REGS_RIP, regs->rip);
+	vcpu->vmcb->save.rflags = regs->rflags;
 
-	vmrun_rip_write(vcpu, regs->rip);
-	vmrun_set_rflags(vcpu, regs->rflags);
-
-	vcpu->arch.exception.pending = false;
-
-	vmrun_make_request(VMRUN_REQ_EVENT, vcpu);
+	// vcpu->exception.pending = false;
+	
+	// vmrun_make_request(VMRUN_REQ_EVENT, vcpu);
 
 	return 0;
 }
@@ -996,127 +1708,96 @@ void vmrun_get_cs_db_l_bits(struct vmrun_vcpu *vcpu, int *db, int *l)
 	*db = cs.db;
 	*l = cs.l;
 }
-EXPORT_SYMBOL_GPL(vmrun_get_cs_db_l_bits);
 
 int vmrun_vcpu_ioctl_get_sregs(struct vmrun_vcpu *vcpu,
-				  struct vmrun_sregs *sregs)
+			       struct vmrun_sregs *sregs)
 {
 	struct desc_ptr dt;
 
-	vmrun_get_segment(vcpu, &sregs->cs, VCPU_SREG_CS);
-	vmrun_get_segment(vcpu, &sregs->ds, VCPU_SREG_DS);
-	vmrun_get_segment(vcpu, &sregs->es, VCPU_SREG_ES);
-	vmrun_get_segment(vcpu, &sregs->fs, VCPU_SREG_FS);
-	vmrun_get_segment(vcpu, &sregs->gs, VCPU_SREG_GS);
-	vmrun_get_segment(vcpu, &sregs->ss, VCPU_SREG_SS);
-
-	vmrun_get_segment(vcpu, &sregs->tr, VCPU_SREG_TR);
+	vmrun_get_segment(vcpu, &sregs->cs,  VCPU_SREG_CS);
+	vmrun_get_segment(vcpu, &sregs->ds,  VCPU_SREG_DS);
+	vmrun_get_segment(vcpu, &sregs->es,  VCPU_SREG_ES);
+	vmrun_get_segment(vcpu, &sregs->fs,  VCPU_SREG_FS);
+	vmrun_get_segment(vcpu, &sregs->gs,  VCPU_SREG_GS);
+	vmrun_get_segment(vcpu, &sregs->ss,  VCPU_SREG_SS);
+	vmrun_get_segment(vcpu, &sregs->tr,  VCPU_SREG_TR);
 	vmrun_get_segment(vcpu, &sregs->ldt, VCPU_SREG_LDTR);
 
-	vmrun_x86_ops->get_idt(vcpu, &dt);
+	vmrun_get_idt(vcpu, &dt);
 	sregs->idt.limit = dt.size;
 	sregs->idt.base = dt.address;
-	vmrun_x86_ops->get_gdt(vcpu, &dt);
+
+	vmrun_get_gdt(vcpu, &dt);
 	sregs->gdt.limit = dt.size;
 	sregs->gdt.base = dt.address;
 
-	sregs->cr0 = vmrun_read_cr0(vcpu);
-	sregs->cr2 = vcpu->arch.cr2;
-	sregs->cr3 = vmrun_read_cr3(vcpu);
-	sregs->cr4 = vmrun_read_cr4(vcpu);
-	sregs->cr8 = vmrun_get_cr8(vcpu);
-	sregs->efer = vcpu->arch.efer;
-	sregs->apic_base = vmrun_get_apic_base(vcpu);
-
-	memset(sregs->interrupt_bitmap, 0, sizeof sregs->interrupt_bitmap);
-
-	if (vcpu->arch.interrupt.pending && !vcpu->arch.interrupt.soft)
-		set_bit(vcpu->arch.interrupt.nr,
-			(unsigned long *)sregs->interrupt_bitmap);
+	sregs->cr0  = vmrun_read_cr0(vcpu);
+	sregs->cr2  = vcpu->cr2;
+	sregs->cr3  = vmrun_read_cr3(vcpu);
+	sregs->cr4  = vmrun_read_cr4(vcpu);
+	sregs->cr8  = vcpu->cr8;
+	sregs->efer = vcpu->efer;
 
 	return 0;
 }
 
-int vmrun_vcpu_ioctl_set_sregs(struct vmrun_vcpu *vcpu,
-				  struct vmrun_sregs *sregs)
+static void vmrun_set_efer(struct vmrun_vcpu *vcpu, u64 efer)
 {
-	struct msr_data apic_base_msr;
+	vcpu->efer = efer;
+	if (!npt_enabled && !(efer & EFER_LMA))
+		efer &= ~EFER_LME;
+
+	vcpu->vmcb->save.efer      = efer | EFER_SVME;
+	vcpu->vmcb->control.clean &= ~(1 << VMCB_CR);
+}
+
+int vmrun_vcpu_ioctl_set_sregs(struct vmrun_vcpu *vcpu,
+			       struct vmrun_sregs *sregs)
+{
 	int mmu_reset_needed = 0;
 	int pending_vec, max_bits, idx;
 	struct desc_ptr dt;
 
-	if (!guest_cpuid_has(vcpu, X86_FEATURE_XSAVE) &&
-	    (sregs->cr4 & X86_CR4_OSXSAVE))
-		return -EINVAL;
-
-	apic_base_msr.data = sregs->apic_base;
-	apic_base_msr.host_initiated = true;
-	if (vmrun_set_apic_base(vcpu, &apic_base_msr))
-		return -EINVAL;
-
 	dt.size = sregs->idt.limit;
 	dt.address = sregs->idt.base;
-	vmrun_x86_ops->set_idt(vcpu, &dt);
+	vmrun_set_idt(vcpu, &dt);
+	
 	dt.size = sregs->gdt.limit;
 	dt.address = sregs->gdt.base;
-	vmrun_x86_ops->set_gdt(vcpu, &dt);
+	vmrun_set_gdt(vcpu, &dt);
 
-	vcpu->arch.cr2 = sregs->cr2;
+	vcpu->cr2 = sregs->cr2;
 	mmu_reset_needed |= vmrun_read_cr3(vcpu) != sregs->cr3;
-	vcpu->arch.cr3 = sregs->cr3;
-	__set_bit(VCPU_EXREG_CR3, (ulong *)&vcpu->arch.regs_avail);
+	vcpu->cr3 = sregs->cr3;
+	__set_bit(VCPU_EXREG_CR3, (ulong *)&vcpu->regs_avail);
 
-	vmrun_set_cr8(vcpu, sregs->cr8);
+	vcpu->cr8 = sregs->cr8;
 
-	mmu_reset_needed |= vcpu->arch.efer != sregs->efer;
-	vmrun_x86_ops->set_efer(vcpu, sregs->efer);
+	mmu_reset_needed |= vcpu->efer != sregs->efer;
+	vmrun_set_efer(vcpu, sregs->efer);
 
 	mmu_reset_needed |= vmrun_read_cr0(vcpu) != sregs->cr0;
-	vmrun_x86_ops->set_cr0(vcpu, sregs->cr0);
-	vcpu->arch.cr0 = sregs->cr0;
+	vmrun_set_cr0(vcpu, sregs->cr0);
+	vcpu->cr0 = sregs->cr0;
 
 	mmu_reset_needed |= vmrun_read_cr4(vcpu) != sregs->cr4;
-	vmrun_x86_ops->set_cr4(vcpu, sregs->cr4);
-	if (sregs->cr4 & (X86_CR4_OSXSAVE | X86_CR4_PKE))
-		vmrun_update_cpuid(vcpu);
-
-	idx = srcu_read_lock(&vcpu->vmrun->srcu);
-	if (!is_long_mode(vcpu) && is_pae(vcpu)) {
-		load_pdptrs(vcpu, vcpu->arch.walk_mmu, vmrun_read_cr3(vcpu));
-		mmu_reset_needed = 1;
-	}
-	srcu_read_unlock(&vcpu->vmrun->srcu, idx);
+	vmrun_set_cr4(vcpu, sregs->cr4);
 
 	if (mmu_reset_needed)
 		vmrun_mmu_reset_context(vcpu);
 
-	max_bits = VMRUN_NR_INTERRUPTS;
-	pending_vec = find_first_bit(
-		(const unsigned long *)sregs->interrupt_bitmap, max_bits);
-	if (pending_vec < max_bits) {
-		vmrun_queue_interrupt(vcpu, pending_vec, false);
-		pr_debug("Set back pending irq %d\n", pending_vec);
-	}
-
-	vmrun_set_segment(vcpu, &sregs->cs, VCPU_SREG_CS);
-	vmrun_set_segment(vcpu, &sregs->ds, VCPU_SREG_DS);
-	vmrun_set_segment(vcpu, &sregs->es, VCPU_SREG_ES);
-	vmrun_set_segment(vcpu, &sregs->fs, VCPU_SREG_FS);
-	vmrun_set_segment(vcpu, &sregs->gs, VCPU_SREG_GS);
-	vmrun_set_segment(vcpu, &sregs->ss, VCPU_SREG_SS);
-
-	vmrun_set_segment(vcpu, &sregs->tr, VCPU_SREG_TR);
+	vmrun_set_segment(vcpu, &sregs->cs,  VCPU_SREG_CS);
+	vmrun_set_segment(vcpu, &sregs->ds,  VCPU_SREG_DS);
+	vmrun_set_segment(vcpu, &sregs->es,  VCPU_SREG_ES);
+	vmrun_set_segment(vcpu, &sregs->fs,  VCPU_SREG_FS);
+	vmrun_set_segment(vcpu, &sregs->gs,  VCPU_SREG_GS);
+	vmrun_set_segment(vcpu, &sregs->ss,  VCPU_SREG_SS);
+	vmrun_set_segment(vcpu, &sregs->tr,  VCPU_SREG_TR);
 	vmrun_set_segment(vcpu, &sregs->ldt, VCPU_SREG_LDTR);
 
-	update_cr8_intercept(vcpu);
+	vmrun_clr_cr_intercept(vcpu, INTERCEPT_CR8_WRITE);
 
-	/* Older userspace won't unhalt the vcpu on reset. */
-	if (vmrun_vcpu_is_bsp(vcpu) && vmrun_rip_read(vcpu) == 0xfff0 &&
-	    sregs->cs.selector == 0xf000 && sregs->cs.base == 0xffff0000 &&
-	    !is_protmode(vcpu))
-		vcpu->arch.mp_state = VMRUN_MP_STATE_RUNNABLE;
-
-	vmrun_make_request(VMRUN_REQ_EVENT, vcpu);
+	// vmrun_make_request(VMRUN_REQ_EVENT, vcpu);
 
 	return 0;
 }
@@ -1179,15 +1860,15 @@ static long vmrun_vcpu_ioctl(struct file *filp,
 			r = vmrun_vcpu_ioctl_get_regs(vcpu, vmrun_regs);
 
 			if (r)
-				goto out_free1;
+				goto out_free;
 			r = -EFAULT;
 
 			if (copy_to_user(argp, vmrun_regs, sizeof(struct vmrun_regs)))
-				goto out_free1;
+				goto out_free;
 
 			r = 0;
 
-		out_free1:
+		out_free:
 			kfree(vmrun_regs);
 			break;
 		}

@@ -14,13 +14,13 @@
 //    (Vol 2: System Programming)
 //
 // 2. KVM from the Linux kernel
-//    (Mostly kvm_main.c, svm.c)
+//    (Mostly vmrun_main.c, mmu.c, x86.c svm.c)
 //
 // 3. Original Intel VT-x vmlaunch demo
 //    (https://github.com/vishmohan/vmlaunch)
 //
-// 4. Original vmrunsample demo
-//    (https://github.com/soulxu/vmrunsample)
+// 4. Original kvmsample demo
+//    (https://github.com/soulxu/kvmsample)
 //
 // Copyright (C) 2017 STROMASYS SA <http://www.stromasys.com>
 // Copyright (C) 2006 Qumranet, Inc.
@@ -90,6 +90,42 @@
  * Bits 4-7 are reserved for more arch-independent bits.
  */
 #define VMRUN_REQ_TLB_FLUSH         (0 | VMRUN_REQUEST_WAIT | VMRUN_REQUEST_NO_WAKEUP)
+
+#define VMRUN_CR0_SELECTIVE_MASK  (X86_CR0_TS | X86_CR0_MP)
+
+#define VMRUN_CPUID_FUNC 0x8000000a
+
+#define VMRUN_VM_CR_VMRUN_DISABLE 4
+
+#define VMRUN_SELECTOR_S_SHIFT 4
+#define VMRUN_SELECTOR_DPL_SHIFT 5
+#define VMRUN_SELECTOR_P_SHIFT 7
+#define VMRUN_SELECTOR_AVL_SHIFT 8
+#define VMRUN_SELECTOR_L_SHIFT 9
+#define VMRUN_SELECTOR_DB_SHIFT 10
+#define VMRUN_SELECTOR_G_SHIFT 11
+
+#define VMRUN_SELECTOR_TYPE_MASK (0xf)
+#define VMRUN_SELECTOR_S_MASK (1 << VMRUN_SELECTOR_S_SHIFT)
+#define VMRUN_SELECTOR_DPL_MASK (3 << VMRUN_SELECTOR_DPL_SHIFT)
+#define VMRUN_SELECTOR_P_MASK (1 << VMRUN_SELECTOR_P_SHIFT)
+#define VMRUN_SELECTOR_AVL_MASK (1 << VMRUN_SELECTOR_AVL_SHIFT)
+#define VMRUN_SELECTOR_L_MASK (1 << VMRUN_SELECTOR_L_SHIFT)
+#define VMRUN_SELECTOR_DB_MASK (1 << VMRUN_SELECTOR_DB_SHIFT)
+#define VMRUN_SELECTOR_G_MASK (1 << VMRUN_SELECTOR_G_SHIFT)
+
+#define VMRUN_SELECTOR_WRITE_MASK (1 << 1)
+#define VMRUN_SELECTOR_READ_MASK VMRUN_SELECTOR_WRITE_MASK
+#define VMRUN_SELECTOR_CODE_MASK (1 << 3)
+
+#define INTERCEPT_CR0_READ	0
+#define INTERCEPT_CR3_READ	3
+#define INTERCEPT_CR4_READ	4
+#define INTERCEPT_CR8_READ	8
+#define INTERCEPT_CR0_WRITE	(16 + 0)
+#define INTERCEPT_CR3_WRITE	(16 + 3)
+#define INTERCEPT_CR4_WRITE	(16 + 4)
+#define INTERCEPT_CR8_WRITE	(16 + 8)
 
 #define INSTR_SVM_VMRUN           ".byte 0x0f, 0x01, 0xd8"
 #define INSTR_SVM_VMMCALL         ".byte 0x0f, 0x01, 0xd9"
@@ -163,6 +199,13 @@ enum vmrun_reg {
 	VCPU_REGS_R15 = 15,
 	VCPU_REGS_RIP,
 	NR_VCPU_REGS
+};
+
+enum vmrun_reg_ex {
+	VCPU_EXREG_PDPTR = NR_VCPU_REGS,
+	VCPU_EXREG_CR3,
+	VCPU_EXREG_RFLAGS,
+	VCPU_EXREG_SEGMENTS,
 };
 
 enum {
@@ -268,6 +311,7 @@ struct vmrun_vcpu {
 	unsigned long cr8;
 	u32 hflags;
 	u64 efer;
+	int mp_state;
 
 	struct vmrun_mmu mmu;
 	struct list_head free_pages;

@@ -67,6 +67,23 @@
 /* For vmrun_memory_region::flags */
 #define VMRUN_MEM_LOG_DIRTY_PAGES	1UL
 
+/* for VMRUN_SET_MP_STATE */
+
+/* not all states are valid on all architectures */
+#define VMRUN_MP_STATE_RUNNABLE          0
+#define VMRUN_MP_STATE_UNINITIALIZED     1
+#define VMRUN_MP_STATE_INIT_RECEIVED     2
+#define VMRUN_MP_STATE_HALTED            3
+#define VMRUN_MP_STATE_SIPI_RECEIVED     4
+#define VMRUN_MP_STATE_STOPPED           5
+#define VMRUN_MP_STATE_CHECK_STOP        6
+#define VMRUN_MP_STATE_OPERATING         7
+#define VMRUN_MP_STATE_LOAD              8
+
+struct vmrun_mp_state {
+	__u32 mp_state;
+};
+
 enum vmrun_exit_reason {
 	VMRUN_EXIT_UNKNOWN          = 0,
 	VMRUN_EXIT_EXCEPTION        = 1,
@@ -80,19 +97,29 @@ enum vmrun_exit_reason {
 /* for VMRUN_RUN */
 struct vmrun_run {
 	/* in */
-	__u32 vcpu;
-	__u32 emulated;  /* skip current instruction */
-	__u32 mmio_completed; /* mmio request completed */
+	__u8 request_interrupt_window;
+	__u8 immediate_exit;
+	__u8 padding1[6];
 
 	/* out */
-	__u32 exit_type;
 	__u32 exit_reason;
-	__u32 instruction_length;
+	__u8 ready_for_interrupt_injection;
+	__u8 if_flag;
+	__u16 flags;
+
+	/* in (pre_vmrun_run), out (post_vmrun_run) */
+	__u64 cr8;
+	__u64 apic_base;
+	
 	union {
 		/* VMRUN_EXIT_UNKNOWN */
 		struct {
-			__u32 hardware_exit_reason;
+			__u64 hardware_exit_reason;
 		} hw;
+		/* VMRUN_EXIT_FAIL_ENTRY */
+		struct {
+			__u64 hardware_entry_failure_reason;
+		} fail_entry;
 		/* VMRUN_EXIT_EXCEPTION */
 		struct {
 			__u32 exception;
@@ -104,27 +131,33 @@ struct vmrun_run {
 #define VMRUN_EXIT_IO_OUT 1
 			__u8 direction;
 			__u8 size; /* bytes */
-			__u8 string;
-			__u8 string_down;
-			__u8 rep;
-			__u8 pad;
 			__u16 port;
-			__u64 count;
-			union {
-				__u64 address;
-				__u32 value;
-			};
+			__u32 count;
+			__u64 data_offset; /* relative to vmrun_run start */
 		} io;
+		/* VMRUN_EXIT_INTERNAL_ERROR */
 		struct {
-		} debug;
-		/* VMRUN_EXIT_MMIO */
-		struct {
-			__u64 phys_addr;
-			__u8  data[8];
-			__u32 len;
-			__u8  is_write;
-		} mmio;
+			__u32 suberror;
+			/* Available with VMRUN_CAP_INTERNAL_ERROR_DATA: */
+			__u32 ndata;
+			__u64 data[16];
+		} internal;
+		char padding[256];
+		
 	};
+	/*
+	 * shared registers between vmrun and userspace.
+	 * vmrun_valid_regs specifies the register classes set by the host
+	 * vmrun_dirty_regs specified the register classes dirtied by userspace
+	 * struct vmrun_sync_regs is architecture specific, as well as the
+	 * bits for vmrun_valid_regs and vmrun_dirty_regs
+	 */
+		__u64 vmrun_valid_regs;
+	__u64 vmrun_dirty_regs;
+	union {
+		struct vmrun_sync_regs regs;
+		char padding[2048];
+	} s;
 };
 
 struct vmrun_regs {

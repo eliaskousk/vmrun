@@ -56,6 +56,25 @@
 #define VMRUN_EXIT_TYPE_FAIL_ENTRY 1
 #define VMRUN_EXIT_TYPE_VM_EXIT    2
 
+#define DE_VECTOR 0
+#define DB_VECTOR 1
+#define BP_VECTOR 3
+#define OF_VECTOR 4
+#define BR_VECTOR 5
+#define UD_VECTOR 6
+#define NM_VECTOR 7
+#define DF_VECTOR 8
+#define TS_VECTOR 10
+#define NP_VECTOR 11
+#define SS_VECTOR 12
+#define GP_VECTOR 13
+#define PF_VECTOR 14
+#define MF_VECTOR 16
+#define AC_VECTOR 17
+#define MC_VECTOR 18
+#define XM_VECTOR 19
+#define VE_VECTOR 20
+
 /*
  * Architectural interrupt line count, and the size of the bitmap needed
  * to hold them.

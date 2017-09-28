@@ -14,7 +14,7 @@
 //    (Vol 2: System Programming)
 //
 // 2. KVM from the Linux kernel
-//    (Mostly vmrun_main.c, mmu.c, x86.c svm.c)
+//    (Mostly kvm_main.c, mmu.c, x86.c svm.c)
 //
 // 3. Original Intel VT-x vmlaunch demo
 //    (https://github.com/vishmohan/vmlaunch)
@@ -66,7 +66,6 @@
 #define V_INTR_MASK               (1 << 24)
 
 #define IOPM_ALLOC_ORDER          2
-#define MSRPM_ALLOC_ORDER         1
 
 #define SEG_TYPE_LDT              2
 #define SEG_TYPE_AVAIL_TSS16      3
@@ -93,10 +92,6 @@
 
 #define VMRUN_CR0_SELECTIVE_MASK  (X86_CR0_TS | X86_CR0_MP)
 
-#define VMRUN_CPUID_FUNC 0x8000000a
-
-#define VMRUN_VM_CR_VMRUN_DISABLE 4
-
 #define VMRUN_SELECTOR_S_SHIFT 4
 #define VMRUN_SELECTOR_DPL_SHIFT 5
 #define VMRUN_SELECTOR_P_SHIFT 7
@@ -118,21 +113,9 @@
 #define VMRUN_SELECTOR_READ_MASK VMRUN_SELECTOR_WRITE_MASK
 #define VMRUN_SELECTOR_CODE_MASK (1 << 3)
 
-#define INTERCEPT_CR0_READ	0
-#define INTERCEPT_CR3_READ	3
-#define INTERCEPT_CR4_READ	4
-#define INTERCEPT_CR8_READ	8
-#define INTERCEPT_CR0_WRITE	(16 + 0)
-#define INTERCEPT_CR3_WRITE	(16 + 3)
-#define INTERCEPT_CR4_WRITE	(16 + 4)
-#define INTERCEPT_CR8_WRITE	(16 + 8)
+#define VMRUN_EXIT_FAIL_ENTRY	9
 
-#define INSTR_SVM_VMRUN           ".byte 0x0f, 0x01, 0xd8"
-#define INSTR_SVM_VMMCALL         ".byte 0x0f, 0x01, 0xd9"
-#define INSTR_SVM_VMLOAD          ".byte 0x0f, 0x01, 0xda"
-#define INSTR_SVM_VMSAVE          ".byte 0x0f, 0x01, 0xdb"
-#define INSTR_SVM_STGI            ".byte 0x0f, 0x01, 0xdc"
-#define INSTR_SVM_CLGI            ".byte 0x0f, 0x01, 0xdd"
+#define SVM_VMMCALL ".byte 0x0f, 0x01, 0xd9"
 
 /*
  * Address types:
@@ -179,6 +162,9 @@ enum {
 			  */
 	VMCB_DIRTY_MAX,
 };
+
+/* TPR and CR2 are always written before VMRUN */
+#define VMCB_ALWAYS_DIRTY_MASK	((1U << VMCB_INTR) | (1U << VMCB_CR2))
 
 enum vmrun_reg {
 	VCPU_REGS_RAX = 0,

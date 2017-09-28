@@ -219,6 +219,13 @@ enum {
 	VCPU_SREG_LDTR,
 };
 
+enum {
+	OUTSIDE_GUEST_MODE,
+	IN_GUEST_MODE,
+	EXITING_GUEST_MODE,
+	READING_SHADOW_PAGE_TABLES,
+};
+
 struct system_table {
 	u16 limit;
 	u64 base;

@@ -73,6 +73,7 @@
 #include <linux/uaccess.h>
 #include <linux/slab.h>
 #include <linux/types.h>
+#include <linux/context_tracking.h>
 #include <asm/desc.h>
 #include <asm/virtext.h>
 
@@ -972,6 +973,54 @@ static void vmrun_vcpu_run(struct vmrun_vcpu *vcpu)
 }
 // STACK_FRAME_NON_STANDARD(vmrun_vcpu_run);
 
+static int vmrun_is_external_interrupt(u32 info)
+{
+	info &= SVM_EVTINJ_TYPE_MASK | SVM_EVTINJ_VALID;
+
+	return info == (SVM_EVTINJ_VALID | SVM_EVTINJ_TYPE_INTR);
+}
+
+static int vmrun_vcpu_handle_exit(struct vmrun_vcpu *vcpu)
+{
+	struct vmrun_run *vmrun_run = vcpu->run;
+	u32 exit_code = vcpu->vmcb->control.exit_code;
+
+	if (!vmrun_is_cr_intercept(vcpu, INTERCEPT_CR0_WRITE))
+		vcpu->cr0 = vcpu->vmcb->save.cr0;
+	
+	if (npt_enabled)
+		vcpu->cr3 = vcpu->vmcb->save.cr3;
+
+	// svm_complete_interrupts(svm);
+
+	if (vcpu->vmcb->control.exit_code == SVM_EXIT_ERR) {
+		vmrun_run->exit_reason = VMRUN_EXIT_FAIL_ENTRY;
+		vmrun_run->fail_entry.hardware_entry_failure_reason
+			= svm->vmcb->control.exit_code;
+
+		pr_err("KVM: FAILED VMRUN WITH VMCB:\n");
+		vmrun_dump_vmcb(vcpu);
+		return 0;
+	}
+
+	if (vmrun_is_external_interrupt(vcpu->vmcb->control.exit_int_info) &&
+	    exit_code != SVM_EXIT_EXCP_BASE + PF_VECTOR &&
+	    exit_code != SVM_EXIT_NPF && exit_code != SVM_EXIT_TASK_SWITCH &&
+	    exit_code != SVM_EXIT_INTR && exit_code != SVM_EXIT_NMI)
+		printk(KERN_ERR "%s: unexpected exit_int_info 0x%x "
+			       "exit_code 0x%x\n",
+		       __func__, svm->vmcb->control.exit_int_info,
+		       exit_code);
+
+	if (exit_code >= ARRAY_SIZE(vmrun_exit_handlers) || !vmrun_exit_handlers[exit_code]) {
+		WARN_ONCE(1, "svm: unexpected exit reason 0x%x\n", exit_code);
+		vmrun_queue_exception(vcpu, UD_VECTOR);
+		return 1;
+	}
+
+	return vmrun_exit_handlers[exit_code](vcpu);
+}
+
 static inline struct vmrun_vcpu *vmrun_get_vcpu(struct vmrun *vmrun, int i)
 {
 	/* Pairs with smp_wmb() in vmrun_vm_ioctl_create_vcpu, in case
@@ -1288,144 +1337,16 @@ void vmrun_vcpu_destroy(struct vmrun_vcpu *vcpu)
 static int vmrun_vcpu_enter_guest(struct vmrun_vcpu *vcpu)
 {
 	int r;
-	bool req_int_win =
-		dm_request_for_irq_injection(vcpu) &&
-		vmrun_cpu_accept_dm_intr(vcpu);
-
-	bool req_immediate_exit = false;
-
-	if (vmrun_request_pending(vcpu)) {
-		if (vmrun_check_request(VMRUN_REQ_MMU_RELOAD, vcpu))
-			vmrun_mmu_unload(vcpu);
-		if (vmrun_check_request(VMRUN_REQ_MIGRATE_TIMER, vcpu))
-			__vmrun_migrate_timers(vcpu);
-		if (vmrun_check_request(VMRUN_REQ_MASTERCLOCK_UPDATE, vcpu))
-			vmrun_gen_update_masterclock(vcpu->vmrun);
-		if (vmrun_check_request(VMRUN_REQ_GLOBAL_CLOCK_UPDATE, vcpu))
-			vmrun_gen_vmrunclock_update(vcpu);
-		if (vmrun_check_request(VMRUN_REQ_CLOCK_UPDATE, vcpu)) {
-			r = vmrun_guest_time_update(vcpu);
-			if (unlikely(r))
-				goto out;
-		}
-		if (vmrun_check_request(VMRUN_REQ_MMU_SYNC, vcpu))
-			vmrun_mmu_sync_roots(vcpu);
-		if (vmrun_check_request(VMRUN_REQ_TLB_FLUSH, vcpu))
-			vmrun_vcpu_flush_tlb(vcpu);
-		if (vmrun_check_request(VMRUN_REQ_REPORT_TPR_ACCESS, vcpu)) {
-			vcpu->run->exit_reason = VMRUN_EXIT_TPR_ACCESS;
-			r = 0;
-			goto out;
-		}
-		if (vmrun_check_request(VMRUN_REQ_TRIPLE_FAULT, vcpu)) {
-			vcpu->run->exit_reason = VMRUN_EXIT_SHUTDOWN;
-			vcpu->mmio_needed = 0;
-			r = 0;
-			goto out;
-		}
-		if (vmrun_check_request(VMRUN_REQ_APF_HALT, vcpu)) {
-			/* Page is swapped out. Do synthetic halt */
-			vcpu->arch.apf.halted = true;
-			r = 1;
-			goto out;
-		}
-		if (vmrun_check_request(VMRUN_REQ_STEAL_UPDATE, vcpu))
-			record_steal_time(vcpu);
-		if (vmrun_check_request(VMRUN_REQ_SMI, vcpu))
-			process_smi(vcpu);
-		if (vmrun_check_request(VMRUN_REQ_NMI, vcpu))
-			process_nmi(vcpu);
-		if (vmrun_check_request(VMRUN_REQ_PMU, vcpu))
-			vmrun_pmu_handle_event(vcpu);
-		if (vmrun_check_request(VMRUN_REQ_PMI, vcpu))
-			vmrun_pmu_deliver_pmi(vcpu);
-		if (vmrun_check_request(VMRUN_REQ_IOAPIC_EOI_EXIT, vcpu)) {
-			BUG_ON(vcpu->arch.pending_ioapic_eoi > 255);
-			if (test_bit(vcpu->arch.pending_ioapic_eoi,
-				     vcpu->arch.ioapic_handled_vectors)) {
-				vcpu->run->exit_reason = VMRUN_EXIT_IOAPIC_EOI;
-				vcpu->run->eoi.vector =
-					vcpu->arch.pending_ioapic_eoi;
-				r = 0;
-				goto out;
-			}
-		}
-		if (vmrun_check_request(VMRUN_REQ_SCAN_IOAPIC, vcpu))
-			vcpu_scan_ioapic(vcpu);
-		if (vmrun_check_request(VMRUN_REQ_APIC_PAGE_RELOAD, vcpu))
-			vmrun_vcpu_reload_apic_access_page(vcpu);
-		if (vmrun_check_request(VMRUN_REQ_HV_CRASH, vcpu)) {
-			vcpu->run->exit_reason = VMRUN_EXIT_SYSTEM_EVENT;
-			vcpu->run->system_event.type = VMRUN_SYSTEM_EVENT_CRASH;
-			r = 0;
-			goto out;
-		}
-		if (vmrun_check_request(VMRUN_REQ_HV_RESET, vcpu)) {
-			vcpu->run->exit_reason = VMRUN_EXIT_SYSTEM_EVENT;
-			vcpu->run->system_event.type = VMRUN_SYSTEM_EVENT_RESET;
-			r = 0;
-			goto out;
-		}
-		if (vmrun_check_request(VMRUN_REQ_HV_EXIT, vcpu)) {
-			vcpu->run->exit_reason = VMRUN_EXIT_HYPERV;
-			vcpu->run->hyperv = vcpu->arch.hyperv.exit;
-			r = 0;
-			goto out;
-		}
-
-		/*
-		 * VMRUN_REQ_HV_STIMER has to be processed after
-		 * VMRUN_REQ_CLOCK_UPDATE, because Hyper-V SynIC timers
-		 * depend on the guest clock being up-to-date
-		 */
-		if (vmrun_check_request(VMRUN_REQ_HV_STIMER, vcpu))
-			vmrun_hv_process_stimers(vcpu);
-	}
-
-	if (vmrun_check_request(VMRUN_REQ_EVENT, vcpu) || req_int_win) {
-		++vcpu->stat.req_event;
-		vmrun_apic_accept_events(vcpu);
-		if (vcpu->arch.mp_state == VMRUN_MP_STATE_INIT_RECEIVED) {
-			r = 1;
-			goto out;
-		}
-
-		if (inject_pending_event(vcpu, req_int_win) != 0)
-			req_immediate_exit = true;
-		else {
-			/* Enable NMI/IRQ window open exits if needed.
-			 *
-			 * SMIs have two cases: 1) they can be nested, and
-			 * then there is nothing to do here because RSM will
-			 * cause a vmexit anyway; 2) or the SMI can be pending
-			 * because inject_pending_event has completed the
-			 * injection of an IRQ or NMI from the previous vmexit,
-			 * and then we request an immediate exit to inject the SMI.
-			 */
-			if (vcpu->arch.smi_pending && !is_smm(vcpu))
-				req_immediate_exit = true;
-			if (vcpu->arch.nmi_pending)
-				vmrun_x86_ops->enable_nmi_window(vcpu);
-			if (vmrun_cpu_has_injectable_intr(vcpu) || req_int_win)
-				vmrun_x86_ops->enable_irq_window(vcpu);
-			WARN_ON(vcpu->arch.exception.pending);
-		}
-
-		if (vmrun_lapic_enabled(vcpu)) {
-			update_cr8_intercept(vcpu);
-			vmrun_lapic_sync_to_vapic(vcpu);
-		}
-	}
-
+	
 	r = vmrun_mmu_reload(vcpu);
+	
 	if (unlikely(r)) {
-		goto cancel_injection;
+		goto out;
 	}
 
 	preempt_disable();
-
-	vmrun_x86_ops->prepare_guest_switch(vcpu);
-	vmrun_load_guest_fpu(vcpu);
+	
+	// vmrun_load_guest_fpu(vcpu);
 
 	/*
 	 * Disable IRQs before setting IN_GUEST_MODE.  Posted interrupt
@@ -1433,6 +1354,7 @@ static int vmrun_vcpu_enter_guest(struct vmrun_vcpu *vcpu)
 	 * result in virtual interrupt delivery.
 	 */
 	local_irq_disable();
+	
 	vcpu->mode = IN_GUEST_MODE;
 
 	srcu_read_unlock(&vcpu->vmrun->srcu, vcpu->srcu_idx);
@@ -1451,114 +1373,38 @@ static int vmrun_vcpu_enter_guest(struct vmrun_vcpu *vcpu)
 	 */
 	smp_mb__after_srcu_read_unlock();
 
-	/*
-	 * This handles the case where a posted interrupt was
-	 * notified with vmrun_vcpu_kick.
-	 */
-	if (vmrun_lapic_enabled(vcpu)) {
-		if (vmrun_x86_ops->sync_pir_to_irr && vcpu->arch.apicv_active)
-			vmrun_x86_ops->sync_pir_to_irr(vcpu);
-	}
-
-	if (vcpu->mode == EXITING_GUEST_MODE || vmrun_request_pending(vcpu)
-	    || need_resched() || signal_pending(current)) {
-		vcpu->mode = OUTSIDE_GUEST_MODE;
-		smp_wmb();
-		local_irq_enable();
-		preempt_enable();
-		vcpu->srcu_idx = srcu_read_lock(&vcpu->vmrun->srcu);
-		r = 1;
-		goto cancel_injection;
-	}
-
-	vmrun_load_guest_xcr0(vcpu);
-
-	if (req_immediate_exit) {
-		vmrun_make_request(VMRUN_REQ_EVENT, vcpu);
-		smp_send_reschedule(vcpu->cpu);
-	}
-
-	trace_vmrun_entry(vcpu->vcpu_id);
-	wait_lapic_expire(vcpu);
+	// vmrun_load_guest_xcr0(vcpu);
+	
 	guest_enter_irqoff();
-
-	if (unlikely(vcpu->arch.switch_db_regs)) {
-		set_debugreg(0, 7);
-		set_debugreg(vcpu->arch.eff_db[0], 0);
-		set_debugreg(vcpu->arch.eff_db[1], 1);
-		set_debugreg(vcpu->arch.eff_db[2], 2);
-		set_debugreg(vcpu->arch.eff_db[3], 3);
-		set_debugreg(vcpu->arch.dr6, 6);
-		vcpu->arch.switch_db_regs &= ~VMRUN_DEBUGREG_RELOAD;
-	}
 
 	vmrun_vcpu_run(vcpu);
 
-	/*
-	 * Do this here before restoring debug registers on the host.  And
-	 * since we do this before handling the vmexit, a DR access vmexit
-	 * can (a) read the correct value of the debug registers, (b) set
-	 * VMRUN_DEBUGREG_WONT_EXIT again.
-	 */
-	if (unlikely(vcpu->arch.switch_db_regs & VMRUN_DEBUGREG_WONT_EXIT)) {
-		WARN_ON(vcpu->guest_debug & VMRUN_GUESTDBG_USE_HW_BP);
-		vmrun_x86_ops->sync_dirty_debug_regs(vcpu);
-		vmrun_update_dr0123(vcpu);
-		vmrun_update_dr6(vcpu);
-		vmrun_update_dr7(vcpu);
-		vcpu->arch.switch_db_regs &= ~VMRUN_DEBUGREG_RELOAD;
-	}
-
-	/*
-	 * If the guest has used debug registers, at least dr7
-	 * will be disabled while returning to the host.
-	 * If we don't have active breakpoints in the host, we don't
-	 * care about the messed up debug address registers. But if
-	 * we have some of them active, restore the old state.
-	 */
-	if (hw_breakpoint_active())
-		hw_breakpoint_restore();
-
-	vcpu->arch.last_guest_tsc = vmrun_read_l1_tsc(vcpu, rdtsc());
-
 	vcpu->mode = OUTSIDE_GUEST_MODE;
+	
 	smp_wmb();
 
-	vmrun_put_guest_xcr0(vcpu);
+	// vmrun_put_guest_xcr0(vcpu);
 
-	vmrun_x86_ops->handle_external_intr(vcpu);
-
-	++vcpu->stat.exits;
+//      Handle external interrupts
+//	local_irq_enable();
+//	/*
+//	 * We must have an instruction with interrupts enabled, so
+//	 * the timer interrupt isn't delayed by the interrupt shadow.
+//	 */
+//	asm("nop");
+//	local_irq_disable();
 
 	guest_exit_irqoff();
 
 	local_irq_enable();
+	
 	preempt_enable();
 
 	vcpu->srcu_idx = srcu_read_lock(&vcpu->vmrun->srcu);
 
-	/*
-	 * Profile VMRUN exit RIPs:
-	 */
-	if (unlikely(prof_on == VMRUN_PROFILING)) {
-		unsigned long rip = vmrun_rip_read(vcpu);
-		profile_hit(VMRUN_PROFILING, (void *)rip);
-	}
-
-	if (unlikely(vcpu->arch.tsc_always_catchup))
-		vmrun_make_request(VMRUN_REQ_CLOCK_UPDATE, vcpu);
-
-	if (vcpu->arch.apic_attention)
-		vmrun_lapic_sync_from_vapic(vcpu);
-
-	vcpu->arch.gpa_available = false;
-	r = vmrun_x86_ops->handle_exit(vcpu);
-	return r;
-
-cancel_injection:
-	vmrun_x86_ops->cancel_injection(vcpu);
-	if (unlikely(vcpu->arch.apic_attention))
-		vmrun_lapic_sync_from_vapic(vcpu);
+	// vcpu->gpa_available = false;
+	
+	r = vmrun_vcpu_handle_exit(vcpu);
 	
 out:
 	return r;

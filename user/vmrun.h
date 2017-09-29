@@ -14,13 +14,13 @@
 //    (Vol 2: System Programming)
 //
 // 2. KVM from the Linux kernel
-//    (Mostly kvm_main.c, svm.c)
+//    (Mostly kvm_main.c, mmu.c, x86.c svm.c)
 //
 // 3. Original Intel VT-x vmlaunch demo
 //    (https://github.com/vishmohan/vmlaunch)
 //
-// 4. Original vmrunsample demo
-//    (https://github.com/soulxu/vmrunsample)
+// 4. Original kvmsample demo
+//    (https://github.com/soulxu/kvmsample)
 //
 // Copyright (C) 2017 STROMASYS SA (http://www.stromasys.com)
 // Copyright (C) 2006 Qumranet, Inc.
@@ -45,13 +45,30 @@
 
 #define VMRUNIO 0xAEE // TODO: Check validity
 
-#define VMRUN_VCPU_CREATE           	_IOW(VMRUNIO,  1, int /* vcpu_slot */)
-#define VMRUN_VCPU_RUN              	_IOWR(VMRUNIO, 2, struct vmrun_run)
-#define VMRUN_GET_REGS              	_IOWR(VMRUNIO, 3, struct vmrun_regs)
-#define VMRUN_SET_REGS              	_IOW(VMRUNIO,  4, struct vmrun_regs)
-#define VMRUN_GET_SREGS             	_IOWR(VMRUNIO, 5, struct vmrun_sregs)
-#define VMRUN_SET_SREGS          	_IOW(VMRUNIO,  6, struct vmrun_sregs)
-#define VMRUN_SET_USER_MEMORY_REGION	_IOW(VMRUNIO,  7, struct vmrun_memory_region)
+/*
+ * ioctls for /dev/vmrun fds:
+ */
+#define VMRUN_CREATE_VM             _IO   (VMRUNIO,   0x00) /* returns a VM fd */
+#define VMRUN_GET_VCPU_MMAP_SIZE    _IO   (VMRUNIO,   0x01) /* in bytes */
+
+/*
+ * ioctls for VM fds
+ * VMRUN_CREATE_VCPU receives as a parameter the vcpu slot, and returns
+ * a vcpu fd.
+ */
+#define VMRUN_CREATE_VCPU            _IO  (VMRUNIO, 0x40)
+#define VMRUN_SET_USER_MEMORY_REGION _IOW (VMRUNIO, 0x41, struct vmrun_userspace_memory_region)
+#define VMRUN_SET_MEMORY_REGION      _IOW (VMRUNIO, 0x42, struct vmrun_memory_region)
+#define VMRUN_CREATE_DEVICE	     _IOWR(VMRUNIO, 0x43, struct vmrun_create_device)
+
+/*
+ * ioctls for vcpu fds
+ */
+#define VMRUN_RUN                    _IO  (VMRUNIO, 0x80)
+#define VMRUN_GET_REGS               _IOR (VMRUNIO, 0x81, struct vmrun_regs)
+#define VMRUN_SET_REGS               _IOW (VMRUNIO, 0x82, struct vmrun_regs)
+#define VMRUN_GET_SREGS              _IOR (VMRUNIO, 0x83, struct vmrun_sregs)
+#define VMRUN_SET_SREGS              _IOW (VMRUNIO, 0x84, struct vmrun_sregs)
 
 #define VMRUN_EXIT_TYPE_FAIL_ENTRY 1
 #define VMRUN_EXIT_TYPE_VM_EXIT    2
@@ -75,6 +92,16 @@
 #define XM_VECTOR 19
 #define VE_VECTOR 20
 
+#define VMRUN_EXIT_UNKNOWN          0
+#define VMRUN_EXIT_EXCEPTION        1
+#define VMRUN_EXIT_IO               2
+#define VMRUN_EXIT_HYPERCALL        3
+#define VMRUN_EXIT_DEBUG            4
+#define VMRUN_EXIT_MMIO             5
+#define VMRUN_EXIT_SHUTDOWN         6
+#define VMRUN_EXIT_FAIL_ENTRY       7
+#define VMRUN_EXIT_INTR             8
+
 /*
  * Architectural interrupt line count, and the size of the bitmap needed
  * to hold them.
@@ -83,8 +110,13 @@
 #define VMRUN_IRQ_BITMAP_SIZE_BYTES	((VMRUN_NR_INTERRUPTS + 7) / 8)
 #define VMRUN_IRQ_BITMAP_SIZE(type)	(VMRUN_IRQ_BITMAP_SIZE_BYTES / sizeof(type))
 
-/* For vmrun_memory_region::flags */
-#define VMRUN_MEM_LOG_DIRTY_PAGES	1UL
+/*
+ * The bit 0 ~ bit 15 of vmrun_memory_region::flags are visible for userspace,
+ * other bits are reserved for vmrun internal use
+ */
+
+#define VMRUN_MEM_LOG_DIRTY_PAGES	(1UL << 0)
+#define VMRUN_MEM_READONLY		(1UL << 1)
 
 /* for VMRUN_SET_MP_STATE */
 
@@ -101,16 +133,6 @@
 
 struct vmrun_mp_state {
 	__u32 mp_state;
-};
-
-enum vmrun_exit_reason {
-	VMRUN_EXIT_UNKNOWN          = 0,
-	VMRUN_EXIT_EXCEPTION        = 1,
-	VMRUN_EXIT_IO               = 2,
-	VMRUN_EXIT_CPUID            = 3,
-	VMRUN_EXIT_DEBUG            = 4,
-	VMRUN_EXIT_HLT              = 5,
-	VMRUN_EXIT_MMIO             = 6,
 };
 
 /* for VMRUN_RUN */

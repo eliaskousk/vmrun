@@ -72,14 +72,23 @@
 
 #define INVALID_PAGE              (~(hpa_t)0)
 
-#define VMRUN_MAX_VCPUS		288
-#define VMRUN_SOFT_MAX_VCPUS	240
-#define VMRUN_MAX_VCPU_ID	1023
-#define VMRUN_USER_MEM_SLOTS	509
-#define VMRUN_PRIVATE_MEM_SLOTS	3 /* memory slots that are not exposed to userspace */
-#define VMRUN_MEM_SLOTS_NUM	(VMRUN_USER_MEM_SLOTS + VMRUN_PRIVATE_MEM_SLOTS)
-#define VMRUN_NR_PAGE_SIZES	3
-#define VMRUN_ADDRESS_SPACE_NUM	2
+#define VMRUN_MAX_VCPUS		 288
+#define VMRUN_SOFT_MAX_VCPUS	 240
+#define VMRUN_MAX_VCPU_ID	 1023
+#define VMRUN_USER_MEM_SLOTS	 509
+#define VMRUN_PRIVATE_MEM_SLOTS	 3 /* memory slots that are not exposed to userspace */
+#define VMRUN_MEM_SLOTS_NUM	 (VMRUN_USER_MEM_SLOTS + VMRUN_PRIVATE_MEM_SLOTS)
+#define VMRUN_NR_PAGE_SIZES	 3
+#define VMRUN_HPAGE_GFN_SHIFT(x) (((x) - 1) * 9)
+#define VMRUN_HPAGE_SIZE(x)	 (1UL << VMRUN_HPAGE_SHIFT(x))
+#define VMRUN_PAGES_PER_HPAGE(x) (VMRUN_HPAGE_SIZE(x) / PAGE_SIZE)
+#define VMRUN_ADDRESS_SPACE_NUM	 2
+
+/*
+ * The bit 16 ~ bit 31 of vmrun_memory_region::flags are internally used
+ * in vmrun, other bits are visible for userspace
+ */
+#define VMRUN_MEMSLOT_INVALID	(1UL << 16)
 
 #define VMRUN_REQUEST_MASK	GENMASK(7,0)
 #define VMRUN_REQUEST_NO_WAKEUP	BIT(8)
@@ -324,6 +333,30 @@ struct vmrun_arch_memory_slot {
 	unsigned short *gfn_track[VMRUN_PAGE_TRACK_MAX];
 };
 
+/*
+ * VMRUN_SET_USER_MEMORY_REGION ioctl allows the following operations:
+ * - create a new memory slot
+ * - delete an existing memory slot
+ * - modify an existing memory slot
+ *   -- move it in the guest physical memory space
+ *   -- just change its flags
+ *
+ * Since flags can be changed by some of these operations, the following
+ * differentiation is the best we can do for __vmrun_set_memory_region():
+ */
+enum vmrun_mr_change {
+	VMRUN_MR_CREATE,
+	VMRUN_MR_DELETE,
+	VMRUN_MR_MOVE,
+	VMRUN_MR_FLAGS_ONLY,
+};
+
+/*
+ * Some of the bitops functions do not support too long bitmaps.
+ * This number must be determined not to exceed such limits.
+ */
+#define VMRUN_MEM_MAX_NR_PAGES ((1UL << 31) - 1)
+
 struct vmrun_memory_slot {
 	gfn_t base_gfn;
 	unsigned long npages;
@@ -364,6 +397,10 @@ struct vmrun {
 	struct mutex lock;
 	refcount_t users_count;
 
+	unsigned int n_used_mmu_pages;
+	unsigned int n_requested_mmu_pages;
+	unsigned int n_max_mmu_pages;
+
 	struct mmu_notifier mmu_notifier;
 	unsigned long mmu_notifier_seq;
 	long mmu_notifier_count;
@@ -384,6 +421,10 @@ int vmrun_mmu_create(struct vmrun_vcpu *vcpu);
 void vmrun_mmu_setup(struct vmrun_vcpu *vcpu);
 void vmrun_mmu_unload(struct vmrun_vcpu *vcpu);
 void vmrun_mmu_reset_context(struct vmrun_vcpu *vcpu);
+void vmrun_mmu_invalidate_mmio_sptes(struct vmrun *vmrun, struct vmrun_memslots *slots);
+unsigned int vmrun_mmu_calculate_mmu_pages(struct vmrun *vmrun);
+void vmrun_mmu_change_mmu_pages(struct vmrun *vmrun, unsigned int vmrun_nr_mmu_pages);
+void vmrun_mmu_zap_collapsible_sptes(struct vmrun *vmrun, const struct vmrun_memory_slot *memslot);
 int vmrun_unmap_hva_range(struct vmrun *vmrun, unsigned long start, unsigned long end);
 int vmrun_age_hva(struct vmrun *vmrun, unsigned long start, unsigned long end);
 int vmrun_test_age_hva(struct vmrun *vmrun, unsigned long hva);

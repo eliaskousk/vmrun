@@ -14,13 +14,13 @@
 //    (Vol 2: System Programming)
 //
 // 2. KVM from the Linux kernel
-//    (Mostly kvm_main.c, svm.c)
+//    (Mostly kvm_main.c, mmu.c, x86.c svm.c)
 //
 // 3. Original Intel VT-x vmlaunch demo
 //    (https://github.com/vishmohan/vmlaunch)
 //
-// 4. Original vmrunsample demo
-//    (https://github.com/soulxu/vmrunsample)
+// 4. Original kvmsample demo
+//    (https://github.com/soulxu/kvmsample)
 //
 // Copyright (C) 2017: STROMASYS SA (http://www.stromasys.com)
 //
@@ -114,7 +114,7 @@ void *vmrun_cpu_thread(void *data)
 	
 	while (1) {
 		printf("vcpu run\n");
-		ret = ioctl(vmrun->vcpus->vcpu_fd, VMRUN_VCPU_RUN, 0);
+		ret = ioctl(vmrun->vcpus->vcpu_fd, VMRUN_RUN, 0);
 	
 		if (ret < 0) {
 			fprintf(stderr, "vcpu run failed\n");
@@ -124,6 +124,9 @@ void *vmrun_cpu_thread(void *data)
 		switch (vmrun->vcpus->vmrun_run->exit_reason) {
 		case VMRUN_EXIT_UNKNOWN:
 			printf("VMRUN_EXIT_UNKNOWN\n");
+			break;
+		case VMRUN_EXIT_HYPERCALL:
+			printf("VMRUN_EXIT_HYPERCALL\n");
 			break;
 		case VMRUN_EXIT_DEBUG:
 			printf("VMRUN_EXIT_DEBUG\n");
@@ -249,7 +252,7 @@ struct vcpu *vmrun_init_vcpu(struct vmrun *vmrun, int vcpu_id, void *(*fn)(void 
 	struct vcpu *vcpu = malloc(sizeof(struct vcpu));
 
 	vcpu->vcpu_id = 0;
-	vcpu->vcpu_fd = ioctl(vmrun->vm_fd, VMRUN_VCPU_CREATE, vcpu->vcpu_id);
+	vcpu->vcpu_fd = ioctl(vmrun->vm_fd, VMRUN_CREATE_VCPU, vcpu->vcpu_id);
 
 	if (vcpu->vcpu_fd < 0) {
 		perror("can not create vcpu");

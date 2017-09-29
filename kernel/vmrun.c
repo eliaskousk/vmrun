@@ -14,7 +14,7 @@
 //    (Vol 2: System Programming)
 //
 // 2. KVM from the Linux kernel
-//    (Mostly vmrun_main.c, mmu.c, x86.c svm.c)
+//    (Mostly kvm_main.c, mmu.c, x86.c svm.c)
 //
 // 3. Original Intel VT-x vmlaunch demo
 //    (https://github.com/vishmohan/vmlaunch)
@@ -97,6 +97,8 @@ static atomic_t cpu_enable_failed;
 struct kmem_cache *vmrun_vcpu_cache;
 
 static __read_mostly struct preempt_ops vmrun_preempt_ops;
+
+static bool largepages_enabled = true;
 
 static unsigned long iopm_base;
 
@@ -1919,7 +1921,7 @@ vcpu_decrement:
  * Sorting algorithm takes advantage of having initially
  * sorted array and known changed memslot position.
  */
-static void update_memslots(struct vmrun_memslots *slots,
+static void vmrun_update_memslots(struct vmrun_memslots *slots,
 			    struct vmrun_memory_slot *new)
 {
 	int id = new->id;
@@ -1968,7 +1970,7 @@ static void update_memslots(struct vmrun_memslots *slots,
 	slots->id_to_index[mslots[i].id] = i;
 }
 
-static int check_memory_region_flags(const struct vmrun_userspace_memory_region *mem)
+static int vmrun_check_memory_region_flags(const struct vmrun_userspace_memory_region *mem)
 {
 	u32 valid_flags = VMRUN_MEM_LOG_DIRTY_PAGES;
 
@@ -1982,7 +1984,7 @@ static int check_memory_region_flags(const struct vmrun_userspace_memory_region 
 	return 0;
 }
 
-static struct vmrun_memslots *install_new_memslots(struct vmrun *vmrun,
+static struct vmrun_memslots *vmrun_install_new_memslots(struct vmrun *vmrun,
 						 int as_id, struct vmrun_memslots *slots)
 {
 	struct vmrun_memslots *old_memslots = __vmrun_memslots(vmrun, as_id);
@@ -2010,9 +2012,231 @@ static struct vmrun_memslots *install_new_memslots(struct vmrun *vmrun,
 	 */
 	slots->generation += VMRUN_ADDRESS_SPACE_NUM * 2 - 1;
 
-	vmrun_arch_memslots_updated(vmrun, slots);
+	/*
+	 * memslots->generation has been incremented.
+	 * mmio generation may have reached its maximum value.
+	 */
+	vmrun_mmu_invalidate_mmio_sptes(vmrun, slots);
 
 	return old_memslots;
+}
+
+#define vmrun_for_each_memslot(memslot, slots)	\
+	for (memslot = &slots->memslots[0];	\
+	      memslot < slots->memslots + VMRUN_MEM_SLOTS_NUM && memslot->npages;\
+		memslot++)
+
+static struct vmrun_memslots *vmrun_alloc_memslots(void)
+{
+	int i;
+	struct vmrun_memslots *slots;
+
+	slots = kvzalloc(sizeof(struct vmrun_memslots), GFP_KERNEL);
+
+	if (!slots)
+		return NULL;
+
+	for (i = 0; i < VMRUN_MEM_SLOTS_NUM; i++)
+		slots->id_to_index[i] = slots->memslots[i].id = i;
+
+	return slots;
+}
+
+static void vmrun_destroy_dirty_bitmap(struct vmrun_memory_slot *memslot)
+{
+	if (!memslot->dirty_bitmap)
+		return;
+
+	kvfree(memslot->dirty_bitmap);
+	memslot->dirty_bitmap = NULL;
+}
+
+void vmrun_page_track_free_memslot(struct vmrun_memory_slot *free,
+				   struct vmrun_memory_slot *dont)
+{
+	int i;
+
+	for (i = 0; i < VMRUN_PAGE_TRACK_MAX; i++)
+		if (!dont || free->arch.gfn_track[i] !=
+			     dont->arch.gfn_track[i]) {
+			kvfree(free->arch.gfn_track[i]);
+			free->arch.gfn_track[i] = NULL;
+		}
+}
+
+void vmrun_arch_free_memslot(struct vmrun *vmrun,
+			     struct vmrun_memory_slot *free,
+			     struct vmrun_memory_slot *dont)
+{
+	int i;
+
+	for (i = 0; i < VMRUN_NR_PAGE_SIZES; ++i) {
+		if (!dont || free->arch.rmap[i] != dont->arch.rmap[i]) {
+			kvfree(free->arch.rmap[i]);
+			free->arch.rmap[i] = NULL;
+		}
+		if (i == 0)
+			continue;
+
+		if (!dont || free->arch.lpage_info[i - 1] !=
+			     dont->arch.lpage_info[i - 1]) {
+			kvfree(free->arch.lpage_info[i - 1]);
+			free->arch.lpage_info[i - 1] = NULL;
+		}
+	}
+
+	vmrun_page_track_free_memslot(free, dont);
+}
+
+static inline gfn_t gfn_to_index(gfn_t gfn, gfn_t base_gfn, int level)
+{
+	/* KVM_HPAGE_GFN_SHIFT(PT_PAGE_TABLE_LEVEL) must be 0. */
+	return (gfn >> VMRUN_HPAGE_GFN_SHIFT(level)) -
+	       (base_gfn >> VMRUN_HPAGE_GFN_SHIFT(level));
+}
+
+int vmrun_arch_create_memslot(struct vmrun *vmrun, struct vmrun_memory_slot *slot,
+			      unsigned long npages)
+{
+	int i;
+
+	for (i = 0; i < VMRUN_NR_PAGE_SIZES; ++i) {
+		struct kvm_lpage_info *linfo;
+		unsigned long ugfn;
+		int lpages;
+		int level = i + 1;
+
+		lpages = gfn_to_index(slot->base_gfn + npages - 1,
+				      slot->base_gfn, level) + 1;
+
+		slot->arch.rmap[i] =
+			kvzalloc(lpages * sizeof(*slot->arch.rmap[i]), GFP_KERNEL);
+		if (!slot->arch.rmap[i])
+			goto out_free;
+		if (i == 0)
+			continue;
+
+		linfo = kvzalloc(lpages * sizeof(*linfo), GFP_KERNEL);
+		if (!linfo)
+			goto out_free;
+
+		slot->arch.lpage_info[i - 1] = linfo;
+
+		if (slot->base_gfn & (VMRUN_PAGES_PER_HPAGE(level) - 1))
+			linfo[0].disallow_lpage = 1;
+		if ((slot->base_gfn + npages) & (VMRUN_PAGES_PER_HPAGE(level) - 1))
+			linfo[lpages - 1].disallow_lpage = 1;
+		ugfn = slot->userspace_addr >> PAGE_SHIFT;
+		/*
+		 * If the gfn and userspace address are not aligned wrt each
+		 * other, or if explicitly asked to, disable large page
+		 * support for this slot
+		 */
+		if ((slot->base_gfn ^ ugfn) & (VMRUN_PAGES_PER_HPAGE(level) - 1) ||
+		    !largepages_enabled) {
+			unsigned long j;
+
+			for (j = 0; j < lpages; ++j)
+				linfo[j].disallow_lpage = 1;
+		}
+	}
+
+	if (vmrun_page_track_create_memslot(slot, npages))
+		goto out_free;
+
+	return 0;
+
+	out_free:
+	for (i = 0; i < VMRUN_NR_PAGE_SIZES; ++i) {
+		kvfree(slot->arch.rmap[i]);
+		slot->arch.rmap[i] = NULL;
+		if (i == 0)
+			continue;
+
+		kvfree(slot->arch.lpage_info[i - 1]);
+		slot->arch.lpage_info[i - 1] = NULL;
+	}
+	return -ENOMEM;
+}
+
+void vmrun_arch_commit_memory_region(struct vmrun *vmrun,
+				     const struct vmrun_userspace_memory_region *mem,
+				     const struct vmrun_memory_slot *old,
+				     const struct vmrun_memory_slot *new,
+				     enum vmrun_mr_change change)
+{
+	int nr_mmu_pages = 0;
+
+	if (!vmrun->n_requested_mmu_pages)
+		nr_mmu_pages = vmrun_mmu_calculate_mmu_pages(vmrun);
+
+	if (nr_mmu_pages)
+		vmrun_mmu_change_mmu_pages(vmrun, nr_mmu_pages);
+
+	/*
+	 * Dirty logging tracks sptes in 4k granularity, meaning that large
+	 * sptes have to be split.  If live migration is successful, the guest
+	 * in the source machine will be destroyed and large sptes will be
+	 * created in the destination. However, if the guest continues to run
+	 * in the source machine (for example if live migration fails), small
+	 * sptes will remain around and cause bad performance.
+	 *
+	 * Scan sptes if dirty logging has been stopped, dropping those
+	 * which can be collapsed into a single large-page spte.  Later
+	 * page faults will create the large-page sptes.
+	 */
+	if ((change != VMRUN_MR_DELETE) &&
+	    (old->flags & VMRUN_MEM_LOG_DIRTY_PAGES) &&
+	    !(new->flags & VMRUN_MEM_LOG_DIRTY_PAGES))
+		vmrun_mmu_zap_collapsible_sptes(vmrun, new);
+
+	/*
+	 * Set up write protection and/or dirty logging for the new slot.
+	 *
+	 * For VMRUN_MR_DELETE and VMRUN_MR_MOVE, the shadow pages of old slot have
+	 * been zapped so no dirty logging staff is needed for old slot. For
+	 * VMRUN_MR_FLAGS_ONLY, the old slot is essentially the same one as the
+	 * new and it's also covered when dealing with the new slot.
+	 *
+	 * FIXME: const-ify all uses of struct vmrun_memory_slot.
+	 */
+//	if (change != VMRUN_MR_DELETE)
+//		vmrun_mmu_slot_apply_flags(vmrun, (struct vmrun_memory_slot *) new);
+}
+
+/*
+ * Free any memory in @free but not in @dont.
+ */
+static void vmrun_free_memslot(struct vmrun *vmrun, struct
+	vmrun_memory_slot *free,
+			       struct vmrun_memory_slot *dont)
+{
+	if (!dont || free->dirty_bitmap != dont->dirty_bitmap)
+		vmrun_destroy_dirty_bitmap(free);
+
+	vmrun_arch_free_memslot(vmrun, free, dont);
+
+	free->npages = 0;
+}
+
+static void vmrun_free_memslots(struct vmrun *vmrun, struct vmrun_memslots *slots)
+{
+	struct vmrun_memory_slot *memslot;
+
+	if (!slots)
+		return;
+
+	vmrun_for_each_memslot(memslot, slots)
+		vmrun_free_memslot(vmrun, memslot, NULL);
+
+	kvfree(slots);
+}
+
+static inline struct vmrun_memslots *__vmrun_memslots(struct vmrun *vmrun, int as_id)
+{
+	return srcu_dereference_check(vmrun->memslots[as_id], &vmrun->srcu,
+				      lockdep_is_held(&vmrun->slots_lock) ||
+				      !refcount_read(&vmrun->users_count));
 }
 
 /*
@@ -2035,7 +2259,7 @@ int __vmrun_set_memory_region(struct vmrun *vmrun,
 	int as_id, id;
 	enum vmrun_mr_change change;
 
-	r = check_memory_region_flags(mem);
+	r = vmrun_check_memory_region_flags(mem);
 	if (r)
 		goto out;
 
@@ -2046,8 +2270,10 @@ int __vmrun_set_memory_region(struct vmrun *vmrun,
 	/* General sanity checks */
 	if (mem->memory_size & (PAGE_SIZE - 1))
 		goto out;
+
 	if (mem->guest_phys_addr & (PAGE_SIZE - 1))
 		goto out;
+
 	/* We can read the guest memory with __xxx_user() later on. */
 	if ((id < VMRUN_USER_MEM_SLOTS) &&
 	    ((mem->userspace_addr & (PAGE_SIZE - 1)) ||
@@ -2055,8 +2281,10 @@ int __vmrun_set_memory_region(struct vmrun *vmrun,
 			(void __user *)(unsigned long)mem->userspace_addr,
 			mem->memory_size)))
 		goto out;
+
 	if (as_id >= VMRUN_ADDRESS_SPACE_NUM || id >= VMRUN_MEM_SLOTS_NUM)
 		goto out;
+
 	if (mem->guest_phys_addr + mem->memory_size < mem->guest_phys_addr)
 		goto out;
 
@@ -2126,11 +2354,11 @@ int __vmrun_set_memory_region(struct vmrun *vmrun,
 			goto out_free;
 	}
 
-	/* Allocate page dirty bitmap if needed */
-	if ((new.flags & VMRUN_MEM_LOG_DIRTY_PAGES) && !new.dirty_bitmap) {
-		if (vmrun_create_dirty_bitmap(&new) < 0)
-			goto out_free;
-	}
+//	/* Allocate page dirty bitmap if needed */
+//	if ((new.flags & VMRUN_MEM_LOG_DIRTY_PAGES) && !new.dirty_bitmap) {
+//		if (vmrun_create_dirty_bitmap(&new) < 0)
+//			goto out_free;
+//	}
 
 	slots = kvzalloc(sizeof(struct vmrun_memslots), GFP_KERNEL);
 	if (!slots)
@@ -2141,7 +2369,7 @@ int __vmrun_set_memory_region(struct vmrun *vmrun,
 		slot = id_to_memslot(slots, id);
 		slot->flags |= VMRUN_MEMSLOT_INVALID;
 
-		old_memslots = install_new_memslots(vmrun, as_id, slots);
+		old_memslots = vmrun_install_new_memslots(vmrun, as_id, slots);
 
 		/* From this point no new shadow pages pointing to a deleted,
 		 * or moved, memslot will be created.
@@ -2150,7 +2378,8 @@ int __vmrun_set_memory_region(struct vmrun *vmrun,
 		 *	- gfn_to_hva (vmrun_read_guest, gfn_to_pfn)
 		 *	- vmrun_is_visible_gfn (mmu_check_roots)
 		 */
-		vmrun_arch_flush_shadow_memslot(vmrun, slot);
+		// vmrun_arch_flush_shadow_memslot(vmrun, slot);
+		vmrun_page_track_flush_slot(vmrun, slot);
 
 		/*
 		 * We can re-use the old_memslots from above, the only difference
@@ -2160,9 +2389,9 @@ int __vmrun_set_memory_region(struct vmrun *vmrun,
 		slots = old_memslots;
 	}
 
-	r = vmrun_arch_prepare_memory_region(vmrun, &new, mem, change);
-	if (r)
-		goto out_slots;
+	r = 0; // vmrun_arch_prepare_memory_region(vmrun, &new, mem, change);
+	// if (r)
+	//	goto out_slots;
 
 	/* actual memory is freed via old in vmrun_free_memslot below */
 	if (change == VMRUN_MR_DELETE) {
@@ -2170,13 +2399,14 @@ int __vmrun_set_memory_region(struct vmrun *vmrun,
 		memset(&new.arch, 0, sizeof(new.arch));
 	}
 
-	update_memslots(slots, &new);
-	old_memslots = install_new_memslots(vmrun, as_id, slots);
+	vmrun_update_memslots(slots, &new);
+	old_memslots = vmrun_install_new_memslots(vmrun, as_id, slots);
 
 	vmrun_arch_commit_memory_region(vmrun, mem, &old, &new, change);
 
 	vmrun_free_memslot(vmrun, &old, &new);
 	kvfree(old_memslots);
+	
 	return 0;
 
 out_slots:
@@ -2244,11 +2474,6 @@ static long vmrun_vm_ioctl(struct file *filp,
 out:
 	return r;
 }
-
-#define vmrun_for_each_memslot(memslot, slots)	\
-	for (memslot = &slots->memslots[0];	\
-	      memslot < slots->memslots + VMRUN_MEM_SLOTS_NUM && memslot->npages;\
-		memslot++)
 
 //static bool vmrun_request_needs_ipi(struct vmrun_vcpu *vcpu, unsigned req)
 //{
@@ -2544,103 +2769,6 @@ static int vmrun_init_mmu_notifier(struct vmrun *vmrun)
 	vmrun->mmu_notifier.ops = &vmrun_mmu_notifier_ops;
 
 	return mmu_notifier_register(&vmrun->mmu_notifier, current->mm);
-}
-
-static struct vmrun_memslots *vmrun_alloc_memslots(void)
-{
-	int i;
-	struct vmrun_memslots *slots;
-
-	slots = kvzalloc(sizeof(struct vmrun_memslots), GFP_KERNEL);
-
-	if (!slots)
-		return NULL;
-
-	for (i = 0; i < VMRUN_MEM_SLOTS_NUM; i++)
-		slots->id_to_index[i] = slots->memslots[i].id = i;
-
-	return slots;
-}
-
-static void vmrun_destroy_dirty_bitmap(struct vmrun_memory_slot *memslot)
-{
-	if (!memslot->dirty_bitmap)
-		return;
-
-	kvfree(memslot->dirty_bitmap);
-	memslot->dirty_bitmap = NULL;
-}
-
-void vmrun_page_track_free_memslot(struct vmrun_memory_slot *free,
-				   struct vmrun_memory_slot *dont)
-{
-	int i;
-
-	for (i = 0; i < VMRUN_PAGE_TRACK_MAX; i++)
-		if (!dont || free->arch.gfn_track[i] !=
-			     dont->arch.gfn_track[i]) {
-			kvfree(free->arch.gfn_track[i]);
-			free->arch.gfn_track[i] = NULL;
-		}
-}
-
-void vmrun_arch_free_memslot(struct vmrun *vmrun,
-			     struct vmrun_memory_slot *free,
-			     struct vmrun_memory_slot *dont)
-{
-	int i;
-
-	for (i = 0; i < VMRUN_NR_PAGE_SIZES; ++i) {
-		if (!dont || free->arch.rmap[i] != dont->arch.rmap[i]) {
-			kvfree(free->arch.rmap[i]);
-			free->arch.rmap[i] = NULL;
-		}
-		if (i == 0)
-			continue;
-
-		if (!dont || free->arch.lpage_info[i - 1] !=
-			     dont->arch.lpage_info[i - 1]) {
-			kvfree(free->arch.lpage_info[i - 1]);
-			free->arch.lpage_info[i - 1] = NULL;
-		}
-	}
-
-	vmrun_page_track_free_memslot(free, dont);
-}
-
-/*
- * Free any memory in @free but not in @dont.
- */
-static void vmrun_free_memslot(struct vmrun *vmrun, struct
-			       vmrun_memory_slot *free,
-			       struct vmrun_memory_slot *dont)
-{
-	if (!dont || free->dirty_bitmap != dont->dirty_bitmap)
-		vmrun_destroy_dirty_bitmap(free);
-
-	vmrun_arch_free_memslot(vmrun, free, dont);
-
-	free->npages = 0;
-}
-
-static void vmrun_free_memslots(struct vmrun *vmrun, struct vmrun_memslots *slots)
-{
-	struct vmrun_memory_slot *memslot;
-
-	if (!slots)
-		return;
-
-	vmrun_for_each_memslot(memslot, slots)
-		vmrun_free_memslot(vmrun, memslot, NULL);
-
-	kvfree(slots);
-}
-
-static inline struct vmrun_memslots *__vmrun_memslots(struct vmrun *vmrun, int as_id)
-{
-	return srcu_dereference_check(vmrun->memslots[as_id], &vmrun->srcu,
-				      lockdep_is_held(&vmrun->slots_lock) ||
-				      !refcount_read(&vmrun->users_count));
 }
 
 static struct vmrun *vmrun_create_vm(unsigned long type)

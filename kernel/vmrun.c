@@ -387,13 +387,13 @@ static void vmrun_get_segment(struct vmrun_vcpu *vcpu,
 	var->base     = s->base;
 	var->limit    = s->limit;
 	var->selector = s->selector;
-	var->type     = s->attrib   & VMRUN_SELECTOR_TYPE_MASK;
-	var->s        = (s->attrib >> VMRUN_SELECTOR_S_SHIFT)   & 1;
-	var->dpl      = (s->attrib >> VMRUN_SELECTOR_DPL_SHIFT) & 3;
-	var->present  = (s->attrib >> VMRUN_SELECTOR_P_SHIFT)   & 1;
-	var->avl      = (s->attrib >> VMRUN_SELECTOR_AVL_SHIFT) & 1;
-	var->l        = (s->attrib >> VMRUN_SELECTOR_L_SHIFT)   & 1;
-	var->db       = (s->attrib >> VMRUN_SELECTOR_DB_SHIFT)  & 1;
+	var->type     = s->attrib   & SVM_SELECTOR_TYPE_MASK;
+	var->s        = (s->attrib >> SVM_SELECTOR_S_SHIFT)   & 1;
+	var->dpl      = (s->attrib >> SVM_SELECTOR_DPL_SHIFT) & 3;
+	var->present  = (s->attrib >> SVM_SELECTOR_P_SHIFT)   & 1;
+	var->avl      = (s->attrib >> SVM_SELECTOR_AVL_SHIFT) & 1;
+	var->l        = (s->attrib >> SVM_SELECTOR_L_SHIFT)   & 1;
+	var->db       = (s->attrib >> SVM_SELECTOR_DB_SHIFT)  & 1;
 
 	/*
 	 * AMD CPUs circa 2014 track the G bit for all segments except CS.
@@ -444,7 +444,7 @@ static void vmrun_get_segment(struct vmrun_vcpu *vcpu,
 			 */
 			if (var->unusable)
 				var->db = 0;
-			/* This is symmetric with svm_set_segment() */
+			/* This is symmetric with vmrun_set_segment() */
 			var->dpl = vcpu->vmcb->save.cpl;
 			break;
 	}
@@ -458,14 +458,14 @@ static void vmrun_set_segment(struct vmrun_vcpu *vcpu,
 	s->base     = var->base;
 	s->limit    = var->limit;
 	s->selector = var->selector;
-	s->attrib   = (var->type & VMRUN_SELECTOR_TYPE_MASK);
-	s->attrib  |= (var->s & 1) << VMRUN_SELECTOR_S_SHIFT;
-	s->attrib  |= (var->dpl & 3) << VMRUN_SELECTOR_DPL_SHIFT;
-	s->attrib  |= ((var->present & 1) && !var->unusable) << VMRUN_SELECTOR_P_SHIFT;
-	s->attrib  |= (var->avl & 1) << VMRUN_SELECTOR_AVL_SHIFT;
-	s->attrib  |= (var->l & 1) << VMRUN_SELECTOR_L_SHIFT;
-	s->attrib  |= (var->db & 1) << VMRUN_SELECTOR_DB_SHIFT;
-	s->attrib  |= (var->g & 1) << VMRUN_SELECTOR_G_SHIFT;
+	s->attrib   = (var->type & SVM_SELECTOR_TYPE_MASK);
+	s->attrib  |= (var->s & 1) << SVM_SELECTOR_S_SHIFT;
+	s->attrib  |= (var->dpl & 3) << SVM_SELECTOR_DPL_SHIFT;
+	s->attrib  |= ((var->present & 1) && !var->unusable) << SVM_SELECTOR_P_SHIFT;
+	s->attrib  |= (var->avl & 1) << SVM_SELECTOR_AVL_SHIFT;
+	s->attrib  |= (var->l & 1) << SVM_SELECTOR_L_SHIFT;
+	s->attrib  |= (var->db & 1) << SVM_SELECTOR_DB_SHIFT;
+	s->attrib  |= (var->g & 1) << SVM_SELECTOR_G_SHIFT;
 
 	/*
 	 * This is always accurate, except if SYSRET returned to a segment
@@ -514,8 +514,8 @@ static void vmrun_set_gdt(struct vmrun_vcpu *vcpu, struct desc_ptr *dt)
 static void vmrun_init_seg(struct vmcb_seg *seg)
 {
 	seg->selector = 0;
-	seg->attrib = VMRUN_SELECTOR_P_MASK | VMRUN_SELECTOR_S_MASK |
-		      VMRUN_SELECTOR_WRITE_MASK; /* Read/Write Data Segment */
+	seg->attrib = SVM_SELECTOR_P_MASK | SVM_SELECTOR_S_MASK |
+		      SVM_SELECTOR_WRITE_MASK; /* Read/Write Data Segment */
 	seg->limit = 0xffff;
 	seg->base = 0;
 }
@@ -523,7 +523,7 @@ static void vmrun_init_seg(struct vmcb_seg *seg)
 static void vmrun_init_sys_seg(struct vmcb_seg *seg, uint32_t type)
 {
 	seg->selector = 0;
-	seg->attrib = VMRUN_SELECTOR_P_MASK | type;
+	seg->attrib = SVM_SELECTOR_P_MASK | type;
 	seg->limit = 0xffff;
 	seg->base = 0;
 }
@@ -564,6 +564,7 @@ static void vmrun_vmcb_init(struct vmrun_vcpu *vcpu)
 	vmrun_init_sys_seg(&save->ldtr, SEG_TYPE_LDT);
 	vmrun_init_sys_seg(&save->tr, SEG_TYPE_AVAIL_TSS16);
 
+	// TODO: Recheck
 	save->efer = EFER_SVME;
 	save->cr0 = cr0 | X86_CR0_PE | X86_CR0_PG | X86_CR0_WP;
 	save->cr4 = X86_CR4_PAE;
@@ -815,6 +816,7 @@ static void vmrun_vcpu_run(struct vmrun_vcpu *vcpu)
 
 	vcpu->vmcb->control.tlb_ctl = TLB_CONTROL_DO_NOTHING;
 
+	// TODO: Check all npt_enabled clauses
 //	if (npt_enabled) {
 //		vcpu->regs_avail &= ~(1 << VCPU_EXREG_PDPTR);
 //		vcpu->regs_dirty &= ~(1 << VCPU_EXREG_PDPTR);
@@ -1601,7 +1603,6 @@ int vmrun_vcpu_ioctl_set_sregs(struct vmrun_vcpu *vcpu,
 			       struct vmrun_sregs *sregs)
 {
 	int mmu_reset_needed = 0;
-	int pending_vec, max_bits, idx;
 	struct desc_ptr dt;
 
 	dt.size = sregs->idt.limit;
@@ -1922,7 +1923,7 @@ vcpu_decrement:
  * sorted array and known changed memslot position.
  */
 static void vmrun_update_memslots(struct vmrun_memslots *slots,
-			    struct vmrun_memory_slot *new)
+			    	  struct vmrun_memory_slot *new)
 {
 	int id = new->id;
 	int i = slots->id_to_index[id];

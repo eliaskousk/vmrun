@@ -224,6 +224,211 @@ static int vmrun_has_svm(void)
 	return 0;
 }
 
+static void vmrun_cpu_enable_nolock(void *junk)
+{
+	struct vmrun_cpu_data *cd;
+	struct desc_struct *gdt;
+	int cpu = raw_smp_processor_id();
+	uint64_t efer;
+	int r;
+
+	if (cpumask_test_cpu(cpu, cpus_enabled))
+		return;
+
+	cpumask_set_cpu((unsigned int)cpu, cpus_enabled);
+
+	if (vmrun_svm_check()) {
+		r = -EBUSY;
+		goto err;
+	}
+
+	if (!vmrun_has_svm()) {
+		printk("cpu_enable: SVM is not supported and enabled on CPU %d\n", cpu);
+		r = -EINVAL;
+		goto err;
+	}
+
+	cd = per_cpu(cpu_data, me);
+
+	if (!cd) {
+		pr_err("%s: cpu_data is NULL on CPU %d\n", __func__, cpu);
+		r = -EINVAL;
+		goto err;
+	}
+
+	asm volatile("cpuid\n\t" : "=b" (cd->max_asid)
+	: "a" (CPUID_EXT_A_SVM_LOCK_LEAF)
+	: "%rcx","%rdx");
+
+	cd->max_asid--;
+	cd->next_asid = cd->max_asid + 1;
+	cd->asid_generation = 1;
+
+	printk("cpu_enable: Initialized ASID on CPU %d\n", me);
+
+	// Alternative to the code below for TSS desc registration
+	//
+	// struct desc_ptr gdt_descr;
+	// asm volatile("sgdt %0" : "=m" (gdt_descr));
+	// gdt = (struct desc_struct *)gdt_descr.address;
+
+	gdt = this_cpu_ptr(&gdt_page)->gdt;
+	cd->tss_desc = (struct ldttss_desc *)(gdt + GDT_ENTRY_TSS);
+
+	printk("cpu_enable: Registered TSS descriptor on CPU %d\n", me);
+
+	vmrun_svm_enable();
+
+	printk("cpu_enable: Enabled SVM on CPU %d\n", me);
+
+	asm volatile("wrmsr\n\t" :
+	: "c" (MSR_VM_HSAVE_PA), "A" (page_to_pfn(cd->save_area) << PAGE_SHIFT)
+	:);
+
+	printk("cpu_setup: Registered host save area on CPU %d\n", me);
+
+	return;
+
+	err:
+	cpumask_clear_cpu(cpu, cpus_enabled);
+	atomic_inc(&cpu_enable_failed);
+	pr_info("cpu_enable_nolock: enabling virtualization on CPU %d failed\n", cpu);
+}
+
+static int vmrun_cpu_enable(unsigned int cpu)
+{
+	raw_spin_lock(&vmrun_count_lock);
+
+	if (vmrun_usage_count)
+		vmrun_cpu_enable_nolock(NULL);
+
+	raw_spin_unlock(&vmrun_count_lock);
+
+	return 0;
+}
+
+static void vmrun_cpu_disable_nolock(void *junk)
+{
+	int cpu = raw_smp_processor_id();
+
+	if (!cpumask_test_cpu(cpu, cpus_enabled))
+		return;
+
+	cpumask_clear_cpu(cpu, cpus_enabled);
+
+	// This hangs the machine, no reason why but it does!
+	// TODO: Retest with new changes
+	//
+	// asm volatile("wrmsr\n\t" :
+	// 			    : "c" (MSR_VM_HSAVE_PA), "A" (0)
+	// 			    :);
+
+	// printk("cpu_disable: Unregistered host save area on CPU %d\n", me);
+
+	vmrun_svm_disable();
+
+	printk("cpu_disable: Disabled SVM on CPU %d\n", cpu);
+}
+
+static int vmrun_cpu_disable(unsigned int cpu)
+{
+	raw_spin_lock(&vmrun_count_lock);
+
+	if (vmrun_usage_count)
+		vmrun_cpu_disable_nolock(NULL);
+
+	raw_spin_unlock(&vmrun_count_lock);
+
+	return 0;
+}
+
+static void vmrun_cpu_disable_all_nolock(void)
+{
+	BUG_ON(!vmrun_usage_count);
+
+	vmrun_usage_count--;
+
+	if (!vmrun_usage_count)
+		on_each_cpu(vmrun_cpu_disable_nolock, NULL, 1);
+}
+
+static void vmrun_cpu_disable_all(void)
+{
+	raw_spin_lock(&vmrun_count_lock);
+
+	vmrun_cpu_disable_all_nolock();
+
+	raw_spin_unlock(&vmrun_count_lock);
+}
+
+static int vmrun_cpu_enable_all(void)
+{
+	int r = 0;
+
+	raw_spin_lock(&vmrun_count_lock);
+
+	vmrun_usage_count++;
+	if (vmrun_usage_count == 1) {
+		atomic_set(&cpu_enable_failed, 0);
+		on_each_cpu(vmrun_cpu_enable_nolock, NULL, 1);
+
+		if (atomic_read(&cpu_enable_failed)) {
+			vmrun_cpu_disable_all_nolock();
+			r = -EBUSY;
+		}
+	}
+
+	raw_spin_unlock(&vmrun_count_lock);
+
+	return r;
+}
+
+static int vmrun_cpu_setup(int cpu)
+{
+	struct vmrun_cpu_data *cd;
+	int r;
+
+	cd = kzalloc(sizeof(struct vmrun_cpu_data), GFP_KERNEL);
+
+	if (!cd)
+		return -ENOMEM;
+
+	cd->cpu = cpu;
+	cd->save_area = alloc_page(GFP_KERNEL);
+
+	if (!cd->save_area) {
+		r = -ENOMEM;
+		goto err;
+	}
+
+	per_cpu(cpu_data, cpu) = cd;
+
+	printk("cpu_setup: Setup CPU %d\n", cpu);
+
+	return 0;
+
+	err:
+	kfree(cd);
+	return r;
+}
+
+static void vmrun_cpu_unsetup(int cpu)
+{
+	// Called by for_each_*_cpu thus cpu = raw_smp_processor_id()
+	// and we can use either.
+
+	struct vmrun_cpu_data *cd = per_cpu(cpu_data, raw_smp_processor_id());
+
+	if (!cd)
+		return;
+
+	per_cpu(cpu_data, raw_smp_processor_id()) = NULL;
+	__free_page(cd->save_area);
+	kfree(cd);
+
+	printk("cpu_unsetup: Unsetup CPU %d\n", cpu);
+}
+
 static int vmrun_iopm_allocate(void)
 {
 	struct page *iopm_pages;
@@ -1916,6 +2121,19 @@ vcpu_decrement:
 	return r;
 }
 
+static inline struct vmrun_memory_slot *
+id_to_memslot(struct vmrun_memslots *slots, int id)
+{
+	int index = slots->id_to_index[id];
+	struct vmrun_memory_slot *slot;
+
+	slot = &slots->memslots[index];
+
+	WARN_ON(slot->id != id);
+
+	return slot;
+}
+
 /*
  * Insert memslot and re-sort memslots based on their GFN,
  * so binary search could be used to lookup GFN.
@@ -2091,7 +2309,7 @@ void vmrun_arch_free_memslot(struct vmrun *vmrun,
 
 static inline gfn_t gfn_to_index(gfn_t gfn, gfn_t base_gfn, int level)
 {
-	/* KVM_HPAGE_GFN_SHIFT(PT_PAGE_TABLE_LEVEL) must be 0. */
+	/* VMRUN_HPAGE_GFN_SHIFT(PT_PAGE_TABLE_LEVEL) must be 0. */
 	return (gfn >> VMRUN_HPAGE_GFN_SHIFT(level)) -
 	       (base_gfn >> VMRUN_HPAGE_GFN_SHIFT(level));
 }
@@ -2420,6 +2638,61 @@ out:
 	return r;
 }
 
+int __vmrun_set_memory_region_vm_destroy(struct vmrun *vmrun, int id, gpa_t gpa, u32 size)
+{
+	int i, r;
+	unsigned long hva;
+	struct vmrun_memslots *slots = vmrun_memslots(vmrun);
+	struct vmrun_memory_slot *slot, old;
+
+	/* Called with vmrun->slots_lock held.  */
+	if (WARN_ON(id >= VMRUN_MEM_SLOTS_NUM))
+		return -EINVAL;
+
+	slot = id_to_memslot(slots, id);
+
+	if (size) {
+		if (slot->npages)
+			return -EEXIST;
+
+		/*
+		 * MAP_SHARED to prevent internal slot pages from being moved
+		 * by fork()/COW.
+		 */
+		hva = vm_mmap(NULL, 0, size, PROT_READ | PROT_WRITE,
+			      MAP_SHARED | MAP_ANONYMOUS, 0);
+		if (IS_ERR((void *)hva))
+			return PTR_ERR((void *)hva);
+	} else {
+		if (!slot->npages)
+			return 0;
+
+		hva = 0;
+	}
+
+	old = *slot;
+
+	for (i = 0; i < VMRUN_ADDRESS_SPACE_NUM; i++) {
+		struct vmrun_userspace_memory_region m;
+
+		m.slot = id | (i << 16);
+		m.flags = 0;
+		m.guest_phys_addr = gpa;
+		m.userspace_addr = hva;
+		m.memory_size = size;
+		r = __vmrun_set_memory_region(vmrun, &m);
+		if (r < 0)
+			return r;
+	}
+
+	if (!size) {
+		r = vm_munmap(old.userspace_addr, old.npages * PAGE_SIZE);
+		WARN_ON(r < 0);
+	}
+
+	return 0;
+}
+
 int vmrun_set_memory_region(struct vmrun *vmrun,
 			    const struct vmrun_userspace_memory_region *mem)
 {
@@ -2428,6 +2701,17 @@ int vmrun_set_memory_region(struct vmrun *vmrun,
 	mutex_lock(&vmrun->slots_lock);
 	r = __vmrun_set_memory_region(vmrun, mem);
 	mutex_unlock(&vmrun->slots_lock);
+	return r;
+}
+
+int vmrun_set_memory_region_vm_destroy(struct vmrun *vmrun, int id, gpa_t gpa, u32 size)
+{
+	int r;
+
+	mutex_lock(&vmrun->slots_lock);
+	r = __vmrun_set_memory_region_vm_destroy(vmrun, id, gpa, size);
+	mutex_unlock(&vmrun->slots_lock);
+
 	return r;
 }
 
@@ -2859,85 +3143,6 @@ out_err_no_disable:
 	return ERR_PTR(r);
 }
 
-static inline struct vmrun_memory_slot *
-id_to_memslot(struct vmrun_memslots *slots, int id)
-{
-	int index = slots->id_to_index[id];
-	struct vmrun_memory_slot *slot;
-
-	slot = &slots->memslots[index];
-
-	WARN_ON(slot->id != id);
-	
-	return slot;
-}
-
-int __vmrun_set_memory_region(struct vmrun *vmrun, int id, gpa_t gpa, u32 size)
-{
-	int i, r;
-	unsigned long hva;
-	struct vmrun_memslots *slots = vmrun_memslots(vmrun);
-	struct vmrun_memory_slot *slot, old;
-
-	/* Called with vmrun->slots_lock held.  */
-	if (WARN_ON(id >= VMRUN_MEM_SLOTS_NUM))
-		return -EINVAL;
-
-	slot = id_to_memslot(slots, id);
-	
-	if (size) {
-		if (slot->npages)
-			return -EEXIST;
-
-		/*
-		 * MAP_SHARED to prevent internal slot pages from being moved
-		 * by fork()/COW.
-		 */
-		hva = vm_mmap(NULL, 0, size, PROT_READ | PROT_WRITE,
-			      MAP_SHARED | MAP_ANONYMOUS, 0);
-		if (IS_ERR((void *)hva))
-			return PTR_ERR((void *)hva);
-	} else {
-		if (!slot->npages)
-			return 0;
-
-		hva = 0;
-	}
-
-	old = *slot;
-	
-	for (i = 0; i < VMRUN_ADDRESS_SPACE_NUM; i++) {
-		struct vmrun_userspace_memory_region m;
-
-		m.slot = id | (i << 16);
-		m.flags = 0;
-		m.guest_phys_addr = gpa;
-		m.userspace_addr = hva;
-		m.memory_size = size;
-		r = __vmrun_set_memory_region(vmrun, &m);
-		if (r < 0)
-			return r;
-	}
-
-	if (!size) {
-		r = vm_munmap(old.userspace_addr, old.npages * PAGE_SIZE);
-		WARN_ON(r < 0);
-	}
-
-	return 0;
-}
-
-int vmrun_set_memory_region(struct vmrun *vmrun, int id, gpa_t gpa, u32 size)
-{
-	int r;
-
-	mutex_lock(&vmrun->slots_lock);
-	r = __vmrun_set_memory_region(vmrun, id, gpa, size);
-	mutex_unlock(&vmrun->slots_lock);
-
-	return r;
-}
-
 static void vmrun_destroy_vm(struct vmrun *vmrun)
 {
 	int i;
@@ -2955,9 +3160,9 @@ static void vmrun_destroy_vm(struct vmrun *vmrun)
 		 * unless the the memory map has changed due to process exit
 		 * or fd copying.
 		 */
-		//vmrun_set_memory_region(vmrun, APIC_ACCESS_PAGE_PRIVATE_MEMSLOT, 0, 0);
-		vmrun_set_memory_region(vmrun, IDENTITY_PAGETABLE_PRIVATE_MEMSLOT, 0, 0);
-		//vmrun_set_memory_region(vmrun, TSS_PRIVATE_MEMSLOT, 0, 0);
+		//vmrun_set_memory_region_vm_destroy(vmrun, APIC_ACCESS_PAGE_PRIVATE_MEMSLOT, 0, 0);
+		vmrun_set_memory_region_vm_destroy(vmrun, IDENTITY_PAGETABLE_PRIVATE_MEMSLOT, 0, 0);
+		//vmrun_set_memory_region_vm_destroy(vmrun, TSS_PRIVATE_MEMSLOT, 0, 0);
 	}
 	
 	vmrun_free_vcpus(vmrun);
@@ -3097,211 +3302,6 @@ static void vmrun_sched_out(struct preempt_notifier *pn,
 		vcpu->preempted = true;
 
 	vmrun_svm_vcpu_put(vcpu);
-}
-
-static void vmrun_cpu_enable_nolock(void *junk)
-{
-	struct vmrun_cpu_data *cd;
-	struct desc_struct *gdt;
-	int cpu = raw_smp_processor_id();
-	uint64_t efer;
-	int r;
-
-	if (cpumask_test_cpu(cpu, cpus_enabled))
-		return;
-
-	cpumask_set_cpu((unsigned int)cpu, cpus_enabled);
-
-	if (vmrun_svm_check()) {
-		r = -EBUSY;
-		goto err;
-	}
-
-	if (!vmrun_has_svm()) {
-		printk("cpu_enable: SVM is not supported and enabled on CPU %d\n", cpu);
-		r = -EINVAL;
-		goto err;
-	}
-
-	cd = per_cpu(cpu_data, me);
-
-	if (!cd) {
-		pr_err("%s: cpu_data is NULL on CPU %d\n", __func__, cpu);
-		r = -EINVAL;
-		goto err;
-	}
-
-	asm volatile("cpuid\n\t" : "=b" (cd->max_asid)
-				 : "a" (CPUID_EXT_A_SVM_LOCK_LEAF)
-				 : "%rcx","%rdx");
-
-	cd->max_asid--;
-	cd->next_asid = cd->max_asid + 1;
-	cd->asid_generation = 1;
-
-	printk("cpu_enable: Initialized ASID on CPU %d\n", me);
-
-	// Alternative to the code below for TSS desc registration
-	//
-	// struct desc_ptr gdt_descr;
-	// asm volatile("sgdt %0" : "=m" (gdt_descr));
-	// gdt = (struct desc_struct *)gdt_descr.address;
-
-	gdt = this_cpu_ptr(&gdt_page)->gdt;
-	cd->tss_desc = (struct ldttss_desc *)(gdt + GDT_ENTRY_TSS);
-
-	printk("cpu_enable: Registered TSS descriptor on CPU %d\n", me);
-
-	vmrun_svm_enable();
-
-	printk("cpu_enable: Enabled SVM on CPU %d\n", me);
-
-	asm volatile("wrmsr\n\t" :
-				 : "c" (MSR_VM_HSAVE_PA), "A" (page_to_pfn(cd->save_area) << PAGE_SHIFT)
-				 :);
-
-	printk("cpu_setup: Registered host save area on CPU %d\n", me);
-
-	return;
-
-err:
-	cpumask_clear_cpu(cpu, cpus_enabled);
-	atomic_inc(&cpu_enable_failed);
-	pr_info("cpu_enable_nolock: enabling virtualization on CPU %d failed\n", cpu);
-}
-
-static int vmrun_cpu_enable(unsigned int cpu)
-{
-	raw_spin_lock(&vmrun_count_lock);
-
-	if (vmrun_usage_count)
-		vmrun_cpu_enable_nolock(NULL);
-
-	raw_spin_unlock(&vmrun_count_lock);
-
-	return 0;
-}
-
-static void vmrun_cpu_disable_nolock(void *junk)
-{
-	int cpu = raw_smp_processor_id();
-
-	if (!cpumask_test_cpu(cpu, cpus_enabled))
-		return;
-
-	cpumask_clear_cpu(cpu, cpus_enabled);
-
-	// This hangs the machine, no reason why but it does!
-	// TODO: Retest with new changes
-	//
-	// asm volatile("wrmsr\n\t" :
-	// 			    : "c" (MSR_VM_HSAVE_PA), "A" (0)
-	// 			    :);
-
-	// printk("cpu_disable: Unregistered host save area on CPU %d\n", me);
-
-	vmrun_svm_disable();
-
-	printk("cpu_disable: Disabled SVM on CPU %d\n", cpu);
-}
-
-static int vmrun_cpu_disable(unsigned int cpu)
-{
-	raw_spin_lock(&vmrun_count_lock);
-
-	if (vmrun_usage_count)
-		vmrun_cpu_disable_nolock(NULL);
-
-	raw_spin_unlock(&vmrun_count_lock);
-
-	return 0;
-}
-
-static void vmrun_cpu_disable_all_nolock(void)
-{
-	BUG_ON(!vmrun_usage_count);
-
-	vmrun_usage_count--;
-
-	if (!vmrun_usage_count)
-		on_each_cpu(vmrun_cpu_disable_nolock, NULL, 1);
-}
-
-static void vmrun_cpu_disable_all(void)
-{
-	raw_spin_lock(&vmrun_count_lock);
-
-	vmrun_cpu_disable_all_nolock();
-
-	raw_spin_unlock(&vmrun_count_lock);
-}
-
-static int vmrun_cpu_enable_all(void)
-{
-	int r = 0;
-
-	raw_spin_lock(&vmrun_count_lock);
-
-	vmrun_usage_count++;
-	if (vmrun_usage_count == 1) {
-		atomic_set(&cpu_enable_failed, 0);
-		on_each_cpu(vmrun_cpu_enable_nolock, NULL, 1);
-
-		if (atomic_read(&cpu_enable_failed)) {
-			vmrun_cpu_disable_all_nolock();
-			r = -EBUSY;
-		}
-	}
-
-	raw_spin_unlock(&vmrun_count_lock);
-
-	return r;
-}
-
-static int vmrun_cpu_setup(int cpu)
-{
-	struct vmrun_cpu_data *cd;
-	int r;
-
-	cd = kzalloc(sizeof(struct vmrun_cpu_data), GFP_KERNEL);
-
-	if (!cd)
-		return -ENOMEM;
-
-	cd->cpu = cpu;
-	cd->save_area = alloc_page(GFP_KERNEL);
-
-	if (!cd->save_area) {
-		r = -ENOMEM;
-		goto err;
-	}
-
-	per_cpu(cpu_data, cpu) = cd;
-
-	printk("cpu_setup: Setup CPU %d\n", cpu);
-
-	return 0;
-
-err:
-	kfree(cd);
-	return r;
-}
-
-static void vmrun_cpu_unsetup(int cpu)
-{
-	// Called by for_each_*_cpu thus cpu = raw_smp_processor_id()
-	// and we can use either.
-
-	struct vmrun_cpu_data *cd = per_cpu(cpu_data, raw_smp_processor_id());
-
-	if (!cd)
-		return;
-
-	per_cpu(cpu_data, raw_smp_processor_id()) = NULL;
-	__free_page(cd->save_area);
-	kfree(cd);
-
-	printk("cpu_unsetup: Unsetup CPU %d\n", cpu);
 }
 
 static int vmrun_init(void)

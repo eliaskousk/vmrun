@@ -1,6 +1,8 @@
 #ifndef _ASM_X86_VMRUN_PAGE_TRACK_H
 #define _ASM_X86_VMRUN_PAGE_TRACK_H
 
+#include "types.h"
+
 enum vmrun_page_track_mode {
 	VMRUN_PAGE_TRACK_WRITE,
 	VMRUN_PAGE_TRACK_MAX,

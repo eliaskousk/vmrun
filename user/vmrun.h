@@ -58,8 +58,6 @@
  */
 #define VMRUN_CREATE_VCPU            _IO  (VMRUNIO, 0x40)
 #define VMRUN_SET_USER_MEMORY_REGION _IOW (VMRUNIO, 0x41, struct vmrun_userspace_memory_region)
-#define VMRUN_SET_MEMORY_REGION      _IOW (VMRUNIO, 0x42, struct vmrun_memory_region)
-#define VMRUN_CREATE_DEVICE	     _IOWR(VMRUNIO, 0x43, struct vmrun_create_device)
 
 /*
  * ioctls for vcpu fds
@@ -195,10 +193,10 @@ struct vmrun_run {
 	 */
 		__u64 vmrun_valid_regs;
 	__u64 vmrun_dirty_regs;
-	union {
-		struct vmrun_sync_regs regs;
-		char padding[2048];
-	} s;
+//	union {
+//		struct vmrun_sync_regs regs;
+//		char padding[2048];
+//	} s;
 };
 
 struct vmrun_regs {

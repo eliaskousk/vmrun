@@ -47,6 +47,23 @@
 #define PT_PAGE_TABLE_LEVEL 1
 #define PT_MAX_HUGEPAGE_LEVEL (PT_PAGE_TABLE_LEVEL + VMRUN_NR_PAGE_SIZES - 1)
 
+void vmrun_mmu_init_vm(struct vmrun *vmrun);
+void vmrun_mmu_uninit_vm(struct vmrun *kvm);
+void vmrun_mmu_destroy(struct vmrun_vcpu *vcpu);
+int vmrun_mmu_create(struct vmrun_vcpu *vcpu);
+void vmrun_mmu_setup(struct vmrun_vcpu *vcpu);
+int vmrun_mmu_load(struct vmrun_vcpu *vcpu);
+void vmrun_mmu_unload(struct vmrun_vcpu *vcpu);
+void vmrun_mmu_reset_context(struct vmrun_vcpu *vcpu);
+void vmrun_mmu_invalidate_mmio_sptes(struct vmrun *vmrun, struct vmrun_memslots *slots);
+unsigned int vmrun_mmu_calculate_mmu_pages(struct vmrun *vmrun);
+void vmrun_mmu_change_mmu_pages(struct vmrun *vmrun, unsigned int vmrun_nr_mmu_pages);
+void vmrun_mmu_zap_collapsible_sptes(struct vmrun *vmrun, const struct vmrun_memory_slot *memslot);
+int vmrun_unmap_hva_range(struct vmrun *vmrun, unsigned long start, unsigned long end);
+int vmrun_age_hva(struct vmrun *vmrun, unsigned long start, unsigned long end);
+int vmrun_test_age_hva(struct vmrun *vmrun, unsigned long hva);
+void vmrun_set_spte_hva(struct vmrun *vmrun, unsigned long hva, pte_t pte);
+
 static inline u64 rsvd_bits(int s, int e)
 {
 	if (e < s)
@@ -70,16 +87,15 @@ int vmrun_handle_page_fault(struct vmrun_vcpu *vcpu, u64 error_code,
 
 static inline unsigned int vmrun_mmu_available_pages(struct vmrun *vmrun)
 {
-	if (vmrun->arch.n_max_mmu_pages > vmrun->arch.n_used_mmu_pages)
-		return vmrun->arch.n_max_mmu_pages -
-			vmrun->arch.n_used_mmu_pages;
+	if (vmrun->n_max_mmu_pages > vmrun->n_used_mmu_pages)
+		return vmrun->n_max_mmu_pages - vmrun->n_used_mmu_pages;
 
 	return 0;
 }
 
 static inline int vmrun_mmu_reload(struct vmrun_vcpu *vcpu)
 {
-	if (likely(vcpu->arch.mmu.root_hpa != INVALID_PAGE))
+	if (likely(vcpu->mmu.root_hpa != INVALID_PAGE))
 		return 0;
 
 	return vmrun_mmu_load(vcpu);
@@ -136,12 +152,14 @@ static inline bool is_write_protection(struct vmrun_vcpu *vcpu)
  * Return zero if the access does not fault; return the page fault error code
  * if the access faults.
  */
-static inline u8 permission_fault(struct vmrun_vcpu *vcpu, struct vmrun_mmu *mmu,
-				  unsigned pte_access, unsigned pte_pkey,
+static inline u8 permission_fault(struct vmrun_vcpu *vcpu,
+				  struct vmrun_mmu *mmu,
+				  unsigned pte_access,
+				  unsigned pte_pkey,
 				  unsigned pfec)
 {
-	int cpl = vmrun_x86_ops->get_cpl(vcpu);
-	unsigned long rflags = vmrun_x86_ops->get_rflags(vcpu);
+	int cpl = vmrun_get_cpl(vcpu);
+	unsigned long rflags = vmrun_get_rflags(vcpu);
 
 	/*
 	 * If CPL < 3, SMAP prevention are disabled if EFLAGS.AC = 1.
@@ -157,31 +175,9 @@ static inline u8 permission_fault(struct vmrun_vcpu *vcpu, struct vmrun_mmu *mmu
 	 * It is important to keep this branchless.
 	 */
 	unsigned long smap = (cpl - 3) & (rflags & X86_EFLAGS_AC);
-	int index = (pfec >> 1) +
-		    (smap >> (X86_EFLAGS_AC_BIT - PFERR_RSVD_BIT + 1));
+	int index = (pfec >> 1) + (smap >> (X86_EFLAGS_AC_BIT - PFERR_RSVD_BIT + 1));
 	bool fault = (mmu->permissions[index] >> pte_access) & 1;
 	u32 errcode = PFERR_PRESENT_MASK;
-
-	WARN_ON(pfec & (PFERR_PK_MASK | PFERR_RSVD_MASK));
-	if (unlikely(mmu->pkru_mask)) {
-		u32 pkru_bits, offset;
-
-		/*
-		* PKRU defines 32 bits, there are 16 domains and 2
-		* attribute bits per domain in pkru.  pte_pkey is the
-		* index of the protection domain, so pte_pkey * 2 is
-		* is the index of the first bit for the domain.
-		*/
-		pkru_bits = (vcpu->arch.pkru >> (pte_pkey * 2)) & 3;
-
-		/* clear present bit, replace PFEC.RSVD with ACC_USER_MASK. */
-		offset = (pfec & ~1) +
-			((pte_access & PT_USER_MASK) << (PFERR_RSVD_BIT - PT_USER_SHIFT));
-
-		pkru_bits &= mmu->pkru_mask >> offset;
-		errcode |= -pkru_bits & PFERR_PK_MASK;
-		fault |= (pkru_bits != 0);
-	}
 
 	return -(u32)fault & errcode;
 }

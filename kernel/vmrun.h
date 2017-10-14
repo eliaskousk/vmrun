@@ -47,7 +47,8 @@
 #include <linux/mm.h>
 #include <linux/mmu_notifier.h>
 #include <linux/preempt.h>
-#include <linux/refcount.h>
+
+#include "page_track.h"
 
 #define CPUID_EXT_1_SVM_LEAF      0x80000001
 #define CPUID_EXT_1_SVM_BIT       0x2
@@ -75,14 +76,17 @@
 #define VMRUN_MAX_VCPUS		 288
 #define VMRUN_SOFT_MAX_VCPUS	 240
 #define VMRUN_MAX_VCPU_ID	 1023
+
 #define VMRUN_USER_MEM_SLOTS	 509
 #define VMRUN_PRIVATE_MEM_SLOTS	 3 /* memory slots that are not exposed to userspace */
 #define VMRUN_MEM_SLOTS_NUM	 (VMRUN_USER_MEM_SLOTS + VMRUN_PRIVATE_MEM_SLOTS)
 #define VMRUN_NR_PAGE_SIZES	 3
+#define VMRUN_ADDRESS_SPACE_NUM	 2
+
 #define VMRUN_HPAGE_GFN_SHIFT(x) (((x) - 1) * 9)
+#define VMRUN_HPAGE_SHIFT(x)	 (PAGE_SHIFT + VMRUN_HPAGE_GFN_SHIFT(x))
 #define VMRUN_HPAGE_SIZE(x)	 (1UL << VMRUN_HPAGE_SHIFT(x))
 #define VMRUN_PAGES_PER_HPAGE(x) (VMRUN_HPAGE_SIZE(x) / PAGE_SIZE)
-#define VMRUN_ADDRESS_SPACE_NUM	 2
 
 /*
  * The bit 16 ~ bit 31 of vmrun_memory_region::flags are internally used
@@ -101,56 +105,29 @@
 
 #define VMRUN_CR0_SELECTIVE_MASK  (X86_CR0_TS | X86_CR0_MP)
 
-#define VMRUN_SELECTOR_S_SHIFT 4
-#define VMRUN_SELECTOR_DPL_SHIFT 5
-#define VMRUN_SELECTOR_P_SHIFT 7
-#define VMRUN_SELECTOR_AVL_SHIFT 8
-#define VMRUN_SELECTOR_L_SHIFT 9
-#define VMRUN_SELECTOR_DB_SHIFT 10
-#define VMRUN_SELECTOR_G_SHIFT 11
+#define VMRUN_TSS_PRIVATE_MEMSLOT			(VMRUN_USER_MEM_SLOTS + 0)
+#define VMRUN_APIC_ACCESS_PAGE_PRIVATE_MEMSLOT		(VMRUN_USER_MEM_SLOTS + 1)
+#define VMRUN_IDENTITY_PAGETABLE_PRIVATE_MEMSLOT	(VMRUN_USER_MEM_SLOTS + 2)
 
-#define VMRUN_SELECTOR_TYPE_MASK (0xf)
-#define VMRUN_SELECTOR_S_MASK (1 << VMRUN_SELECTOR_S_SHIFT)
-#define VMRUN_SELECTOR_DPL_MASK (3 << VMRUN_SELECTOR_DPL_SHIFT)
-#define VMRUN_SELECTOR_P_MASK (1 << VMRUN_SELECTOR_P_SHIFT)
-#define VMRUN_SELECTOR_AVL_MASK (1 << VMRUN_SELECTOR_AVL_SHIFT)
-#define VMRUN_SELECTOR_L_MASK (1 << VMRUN_SELECTOR_L_SHIFT)
-#define VMRUN_SELECTOR_DB_MASK (1 << VMRUN_SELECTOR_DB_SHIFT)
-#define VMRUN_SELECTOR_G_MASK (1 << VMRUN_SELECTOR_G_SHIFT)
+#define PFERR_PRESENT_BIT 0
+#define PFERR_WRITE_BIT 1
+#define PFERR_USER_BIT 2
+#define PFERR_RSVD_BIT 3
+#define PFERR_FETCH_BIT 4
+#define PFERR_PK_BIT 5
+#define PFERR_GUEST_FINAL_BIT 32
+#define PFERR_GUEST_PAGE_BIT 33
 
-#define VMRUN_SELECTOR_WRITE_MASK (1 << 1)
-#define VMRUN_SELECTOR_READ_MASK VMRUN_SELECTOR_WRITE_MASK
-#define VMRUN_SELECTOR_CODE_MASK (1 << 3)
-
-#define VMRUN_EXIT_FAIL_ENTRY	9
+#define PFERR_PRESENT_MASK (1U << PFERR_PRESENT_BIT)
+#define PFERR_WRITE_MASK (1U << PFERR_WRITE_BIT)
+#define PFERR_USER_MASK (1U << PFERR_USER_BIT)
+#define PFERR_RSVD_MASK (1U << PFERR_RSVD_BIT)
+#define PFERR_FETCH_MASK (1U << PFERR_FETCH_BIT)
+#define PFERR_PK_MASK (1U << PFERR_PK_BIT)
+#define PFERR_GUEST_FINAL_MASK (1ULL << PFERR_GUEST_FINAL_BIT)
+#define PFERR_GUEST_PAGE_MASK (1ULL << PFERR_GUEST_PAGE_BIT)
 
 #define SVM_VMMCALL ".byte 0x0f, 0x01, 0xd9"
-
-/*
- * Address types:
- *
- *  gva - guest virtual address
- *  gpa - guest physical address
- *  gfn - guest frame number
- *  hva - host virtual address
- *  hpa - host physical address
- *  hfn - host frame number
- */
-
-typedef unsigned long  gva_t;
-typedef u64            gpa_t;
-typedef u64            gfn_t;
-
-typedef unsigned long  hva_t;
-typedef u64            hpa_t;
-typedef u64            hfn_t;
-
-typedef hfn_t          vmrun_pfn_t;
-
-enum vmrun_page_track_mode {
-	VMRUN_PAGE_TRACK_WRITE,
-	VMRUN_PAGE_TRACK_MAX,
-};
 
 enum {
 	VMCB_INTERCEPTS, /* Intercept vectors, TSC offset,
@@ -244,6 +221,8 @@ struct vmrun_cpu_data {
 	struct page *save_area;
 };
 
+struct vmrun_vcpu;
+
 struct vmrun_mmu {
 	void (*new_cr3)(struct vmrun_vcpu *vcpu);
 	int (*page_fault)(struct vmrun_vcpu *vcpu, gva_t gva, u32 err);
@@ -253,7 +232,15 @@ struct vmrun_mmu {
 	hpa_t root_hpa;
 	int root_level;
 	int shadow_root_level;
+
+	/*
+	 * Bitmap; bit set = permission fault
+	 * Byte index: page fault error code [4:1]
+	 * Bit index: pte permissions in ACC_* format
+	 */
+	u8 permissions[16];
 };
+
 
 struct vmrun_vcpu {
 	struct vmrun *vmrun;
@@ -395,7 +382,7 @@ struct vmrun {
 	int last_boosted_vcpu;
 	struct list_head vm_list;
 	struct mutex lock;
-	refcount_t users_count;
+	atomic_t users_count;
 
 	unsigned int n_used_mmu_pages;
 	unsigned int n_requested_mmu_pages;
@@ -413,21 +400,5 @@ struct vmrun {
 	atomic_t noncoherent_dma_count;
 	struct hlist_head mask_notifier_list; /* reads protected by irq_srcu, writes by irq_lock */
 };
-
-void vmrun_mmu_init_vm(struct vmrun *vmrun);
-void vmrun_mmu_uninit_vm(struct vmrun *kvm);
-void vmrun_mmu_destroy(struct vmrun_vcpu *vcpu);
-int vmrun_mmu_create(struct vmrun_vcpu *vcpu);
-void vmrun_mmu_setup(struct vmrun_vcpu *vcpu);
-void vmrun_mmu_unload(struct vmrun_vcpu *vcpu);
-void vmrun_mmu_reset_context(struct vmrun_vcpu *vcpu);
-void vmrun_mmu_invalidate_mmio_sptes(struct vmrun *vmrun, struct vmrun_memslots *slots);
-unsigned int vmrun_mmu_calculate_mmu_pages(struct vmrun *vmrun);
-void vmrun_mmu_change_mmu_pages(struct vmrun *vmrun, unsigned int vmrun_nr_mmu_pages);
-void vmrun_mmu_zap_collapsible_sptes(struct vmrun *vmrun, const struct vmrun_memory_slot *memslot);
-int vmrun_unmap_hva_range(struct vmrun *vmrun, unsigned long start, unsigned long end);
-int vmrun_age_hva(struct vmrun *vmrun, unsigned long start, unsigned long end);
-int vmrun_test_age_hva(struct vmrun *vmrun, unsigned long hva);
-void vmrun_set_spte_hva(struct vmrun *vmrun, unsigned long hva, pte_t pte);
 
 #endif // VMRUN_H

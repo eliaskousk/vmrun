@@ -29,7 +29,7 @@
 #include <linux/compiler.h>
 #include <linux/srcu.h>
 #include <linux/slab.h>
-#include <linux/sched/signal.h>
+// #include <linux/sched/signal.h>
 #include <linux/uaccess.h>
 #include <linux/hash.h>
 #include <linux/kern_levels.h>
@@ -130,11 +130,6 @@ module_param(dbg, bool, 0644);
 /* The mask for the R/X bits in EPT PTEs */
 #define PT64_EPT_READABLE_MASK			0x1ull
 #define PT64_EPT_EXECUTABLE_MASK		0x4ull
-
-#include <trace/events/vmrun.h>
-
-#define CREATE_TRACE_POINTS
-#include "mmutrace.h"
 
 #define SPTE_HOST_WRITEABLE	(1ULL << PT_FIRST_AVAIL_BITS_SHIFT)
 #define SPTE_MMU_WRITEABLE	(1ULL << (PT_FIRST_AVAIL_BITS_SHIFT + 1))
@@ -380,7 +375,7 @@ static int is_cpuid_PSE36(void)
 
 static int is_nx(struct vmrun_vcpu *vcpu)
 {
-	return vcpu->arch.efer & EFER_NX;
+	return vcpu->efer & EFER_NX;
 }
 
 static int is_shadow_present_pte(u64 pte)
@@ -771,14 +766,14 @@ static int mmu_topup_memory_caches(struct vmrun_vcpu *vcpu)
 {
 	int r;
 
-	r = mmu_topup_memory_cache(&vcpu->arch.mmu_pte_list_desc_cache,
+	r = mmu_topup_memory_cache(&vcpu->mmu_pte_list_desc_cache,
 				   pte_list_desc_cache, 8 + PTE_PREFETCH_NUM);
 	if (r)
 		goto out;
-	r = mmu_topup_memory_cache_page(&vcpu->arch.mmu_page_cache, 8);
+	r = mmu_topup_memory_cache_page(&vcpu->mmu_page_cache, 8);
 	if (r)
 		goto out;
-	r = mmu_topup_memory_cache(&vcpu->arch.mmu_page_header_cache,
+	r = mmu_topup_memory_cache(&vcpu->mmu_page_header_cache,
 				   mmu_page_header_cache, 4);
 out:
 	return r;
@@ -786,10 +781,10 @@ out:
 
 static void mmu_free_memory_caches(struct vmrun_vcpu *vcpu)
 {
-	mmu_free_memory_cache(&vcpu->arch.mmu_pte_list_desc_cache,
+	mmu_free_memory_cache(&vcpu->mmu_pte_list_desc_cache,
 				pte_list_desc_cache);
-	mmu_free_memory_cache_page(&vcpu->arch.mmu_page_cache);
-	mmu_free_memory_cache(&vcpu->arch.mmu_page_header_cache,
+	mmu_free_memory_cache_page(&vcpu->mmu_page_cache);
+	mmu_free_memory_cache(&vcpu->mmu_page_header_cache,
 				mmu_page_header_cache);
 }
 
@@ -804,7 +799,7 @@ static void *mmu_memory_cache_alloc(struct vmrun_mmu_memory_cache *mc)
 
 static struct pte_list_desc *mmu_alloc_pte_list_desc(struct vmrun_vcpu *vcpu)
 {
-	return mmu_memory_cache_alloc(&vcpu->arch.mmu_pte_list_desc_cache);
+	return mmu_memory_cache_alloc(&vcpu->mmu_pte_list_desc_cache);
 }
 
 static void mmu_free_pte_list_desc(struct pte_list_desc *pte_list_desc)
@@ -865,42 +860,6 @@ void vmrun_mmu_gfn_allow_lpage(struct vmrun_memory_slot *slot, gfn_t gfn)
 	update_gfn_disallow_lpage_count(slot, gfn, -1);
 }
 
-static void account_shadowed(struct vmrun *vmrun, struct vmrun_mmu_page *sp)
-{
-	struct vmrun_memslots *slots;
-	struct vmrun_memory_slot *slot;
-	gfn_t gfn;
-
-	vmrun->arch.indirect_shadow_pages++;
-	gfn = sp->gfn;
-	slots = vmrun_memslots_for_spte_role(vmrun, sp->role);
-	slot = __gfn_to_memslot(slots, gfn);
-
-	/* the non-leaf shadow pages are keeping readonly. */
-	if (sp->role.level > PT_PAGE_TABLE_LEVEL)
-		return vmrun_slot_page_track_add_page(vmrun, slot, gfn,
-						    KVM_PAGE_TRACK_WRITE);
-
-	vmrun_mmu_gfn_disallow_lpage(slot, gfn);
-}
-
-static void unaccount_shadowed(struct vmrun *vmrun, struct vmrun_mmu_page *sp)
-{
-	struct vmrun_memslots *slots;
-	struct vmrun_memory_slot *slot;
-	gfn_t gfn;
-
-	vmrun->arch.indirect_shadow_pages--;
-	gfn = sp->gfn;
-	slots = vmrun_memslots_for_spte_role(vmrun, sp->role);
-	slot = __gfn_to_memslot(slots, gfn);
-	if (sp->role.level > PT_PAGE_TABLE_LEVEL)
-		return vmrun_slot_page_track_remove_page(vmrun, slot, gfn,
-						       KVM_PAGE_TRACK_WRITE);
-
-	vmrun_mmu_gfn_allow_lpage(slot, gfn);
-}
-
 static bool __mmu_gfn_lpage_is_disallowed(gfn_t gfn, int level,
 					  struct vmrun_memory_slot *slot)
 {
@@ -931,7 +890,7 @@ static int host_mapping_level(struct vmrun *vmrun, gfn_t gfn)
 	page_size = vmrun_host_page_size(vmrun, gfn);
 
 	for (i = PT_PAGE_TABLE_LEVEL; i <= PT_MAX_HUGEPAGE_LEVEL; ++i) {
-		if (page_size >= KVM_HPAGE_SIZE(i))
+		if (page_size >= VMRUN_HPAGE_SIZE(i))
 			ret = i;
 		else
 			break;
@@ -943,7 +902,7 @@ static int host_mapping_level(struct vmrun *vmrun, gfn_t gfn)
 static inline bool memslot_valid_for_gpte(struct vmrun_memory_slot *slot,
 					  bool no_dirty_log)
 {
-	if (!slot || slot->flags & KVM_MEMSLOT_INVALID)
+	if (!slot || slot->flags & VMRUN_MEMSLOT_INVALID)
 		return false;
 	if (no_dirty_log && slot->dirty_bitmap)
 		return false;
@@ -1120,7 +1079,7 @@ static bool rmap_can_add(struct vmrun_vcpu *vcpu)
 {
 	struct vmrun_mmu_memory_cache *cache;
 
-	cache = &vcpu->arch.mmu_pte_list_desc_cache;
+	cache = &vcpu->mmu_pte_list_desc_cache;
 	return mmu_memory_cache_free_objects(cache);
 }
 
@@ -1587,7 +1546,7 @@ static bool slot_rmap_walk_okay(struct slot_rmap_walk_iterator *iterator)
 static void slot_rmap_walk_next(struct slot_rmap_walk_iterator *iterator)
 {
 	if (++iterator->rmap <= iterator->end_rmap) {
-		iterator->gfn += (1UL << KVM_HPAGE_GFN_SHIFT(iterator->level));
+		iterator->gfn += (1UL << VMRUN_HPAGE_GFN_SHIFT(iterator->level));
 		return;
 	}
 
@@ -1623,7 +1582,7 @@ static int vmrun_handle_hva_range(struct vmrun *vmrun,
 	int ret = 0;
 	int i;
 
-	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
+	for (i = 0; i < VMRUN_ADDRESS_SPACE_NUM; i++) {
 		slots = __vmrun_memslots(vmrun, i);
 		vmrun_for_each_memslot(memslot, slots) {
 			unsigned long hva_start, hva_end;
@@ -1732,22 +1691,6 @@ int vmrun_test_age_hva(struct vmrun *vmrun, unsigned long hva)
 	return vmrun_handle_hva(vmrun, hva, 0, vmrun_test_age_rmapp);
 }
 
-#ifdef MMU_DEBUG
-static int is_empty_shadow_page(u64 *spt)
-{
-	u64 *pos;
-	u64 *end;
-
-	for (pos = spt, end = pos + PAGE_SIZE / sizeof(u64); pos != end; pos++)
-		if (is_shadow_present_pte(*pos)) {
-			printk(KERN_ERR "%s: %p %llx\n", __func__,
-			       pos, *pos);
-			return 0;
-		}
-	return 1;
-}
-#endif
-
 /*
  * This value is the sum of all of the vmrun instances's
  * vmrun->arch.n_used_mmu_pages values.  We need a global,
@@ -1756,7 +1699,7 @@ static int is_empty_shadow_page(u64 *spt)
  */
 static inline void vmrun_mod_used_mmu_pages(struct vmrun *vmrun, int nr)
 {
-	vmrun->arch.n_used_mmu_pages += nr;
+	vmrun->n_used_mmu_pages += nr;
 	percpu_counter_add(&vmrun_total_used_mmu_pages, nr);
 }
 
@@ -1773,7 +1716,7 @@ static void vmrun_mmu_free_page(struct vmrun_mmu_page *sp)
 
 static unsigned vmrun_page_table_hashfn(gfn_t gfn)
 {
-	return hash_64(gfn, KVM_MMU_HASH_SHIFT);
+	return hash_64(gfn, VMRUN_MMU_HASH_SHIFT);
 }
 
 static void mmu_page_add_parent_pte(struct vmrun_vcpu *vcpu,
@@ -1802,10 +1745,10 @@ static struct vmrun_mmu_page *vmrun_mmu_alloc_page(struct vmrun_vcpu *vcpu, int 
 {
 	struct vmrun_mmu_page *sp;
 
-	sp = mmu_memory_cache_alloc(&vcpu->arch.mmu_page_header_cache);
-	sp->spt = mmu_memory_cache_alloc(&vcpu->arch.mmu_page_cache);
+	sp = mmu_memory_cache_alloc(&vcpu->mmu_page_header_cache);
+	sp->spt = mmu_memory_cache_alloc(&vcpu->mmu_page_cache);
 	if (!direct)
-		sp->gfns = mmu_memory_cache_alloc(&vcpu->arch.mmu_page_cache);
+		sp->gfns = mmu_memory_cache_alloc(&vcpu->mmu_page_cache);
 	set_page_private(virt_to_page(sp->spt), (unsigned long)sp);
 
 	/*
@@ -1860,13 +1803,13 @@ static void nonpaging_update_pte(struct vmrun_vcpu *vcpu,
 	WARN_ON(1);
 }
 
-#define KVM_PAGE_ARRAY_NR 16
+#define VMRUN_PAGE_ARRAY_NR 16
 
 struct vmrun_mmu_pages {
 	struct mmu_page_and_offset {
 		struct vmrun_mmu_page *sp;
 		unsigned int idx;
-	} page[KVM_PAGE_ARRAY_NR];
+	} page[VMRUN_PAGE_ARRAY_NR];
 	unsigned int nr;
 };
 
@@ -1883,7 +1826,7 @@ static int mmu_pages_add(struct vmrun_mmu_pages *pvec, struct vmrun_mmu_page *sp
 	pvec->page[pvec->nr].sp = sp;
 	pvec->page[pvec->nr].idx = idx;
 	pvec->nr++;
-	return (pvec->nr == KVM_PAGE_ARRAY_NR);
+	return (pvec->nr == VMRUN_PAGE_ARRAY_NR);
 }
 
 static inline void clear_unsync_child_bit(struct vmrun_mmu_page *sp, int idx)
@@ -1985,7 +1928,7 @@ static bool __vmrun_sync_page(struct vmrun_vcpu *vcpu, struct vmrun_mmu_page *sp
 		return false;
 	}
 
-	if (vcpu->arch.mmu.sync_page(vcpu, sp) == 0) {
+	if (vcpu->mmu.sync_page(vcpu, sp) == 0) {
 		vmrun_mmu_prepare_zap_page(vcpu->vmrun, sp, invalid_list);
 		return false;
 	}
@@ -2005,15 +1948,8 @@ static void vmrun_mmu_flush_or_zap(struct vmrun_vcpu *vcpu,
 	if (remote_flush)
 		vmrun_flush_remote_tlbs(vcpu->vmrun);
 	else if (local_flush)
-		vmrun_make_request(KVM_REQ_TLB_FLUSH, vcpu);
+		vmrun_make_request(VMRUN_REQ_TLB_FLUSH, vcpu);
 }
-
-#ifdef CONFIG_KVM_MMU_AUDIT
-#include "mmu_audit.c"
-#else
-static void vmrun_mmu_audit(struct vmrun_vcpu *vcpu, int point) { }
-static void mmu_audit_disable(void) { }
-#endif
 
 static bool is_obsolete_sp(struct vmrun *vmrun, struct vmrun_mmu_page *sp)
 {
@@ -2179,14 +2115,14 @@ static struct vmrun_mmu_page *vmrun_mmu_get_page(struct vmrun_vcpu *vcpu,
 	int collisions = 0;
 	LIST_HEAD(invalid_list);
 
-	role = vcpu->arch.mmu.base_role;
+	role = vcpu->mmu.base_role;
 	role.level = level;
 	role.direct = direct;
 	if (role.direct)
 		role.cr4_pae = 0;
 	role.access = access;
-	if (!vcpu->arch.mmu.direct_map
-	    && vcpu->arch.mmu.root_level <= PT32_ROOT_LEVEL) {
+	if (!vcpu->mmu.direct_map
+	    && vcpu->mmu.root_level <= PT32_ROOT_LEVEL) {
 		quadrant = gaddr >> (PAGE_SHIFT + (PT64_PT_BITS * level));
 		quadrant &= (1 << ((PT32_PT_BITS - PT64_PT_BITS) * level)) - 1;
 		role.quadrant = quadrant;
@@ -2211,11 +2147,11 @@ static struct vmrun_mmu_page *vmrun_mmu_get_page(struct vmrun_vcpu *vcpu,
 				break;
 
 			WARN_ON(!list_empty(&invalid_list));
-			vmrun_make_request(KVM_REQ_TLB_FLUSH, vcpu);
+			vmrun_make_request(VMRUN_REQ_TLB_FLUSH, vcpu);
 		}
 
 		if (sp->unsync_children)
-			vmrun_make_request(KVM_REQ_MMU_SYNC, vcpu);
+			vmrun_make_request(VMRUN_REQ_MMU_SYNC, vcpu);
 
 		__clear_sp_write_flooding_count(sp);
 		trace_vmrun_mmu_get_page(sp, false);
@@ -2259,17 +2195,17 @@ static void shadow_walk_init(struct vmrun_shadow_walk_iterator *iterator,
 			     struct vmrun_vcpu *vcpu, u64 addr)
 {
 	iterator->addr = addr;
-	iterator->shadow_addr = vcpu->arch.mmu.root_hpa;
-	iterator->level = vcpu->arch.mmu.shadow_root_level;
+	iterator->shadow_addr = vcpu->mmu.root_hpa;
+	iterator->level = vcpu->mmu.shadow_root_level;
 
 	if (iterator->level == PT64_ROOT_4LEVEL &&
-	    vcpu->arch.mmu.root_level < PT64_ROOT_4LEVEL &&
-	    !vcpu->arch.mmu.direct_map)
+	    vcpu->mmu.root_level < PT64_ROOT_4LEVEL &&
+	    !vcpu->mmu.direct_map)
 		--iterator->level;
 
 	if (iterator->level == PT32E_ROOT_LEVEL) {
 		iterator->shadow_addr
-			= vcpu->arch.mmu.pae_root[(addr >> 30) & 3];
+			= vcpu->mmu.pae_root[(addr >> 30) & 3];
 		iterator->shadow_addr &= PT64_BASE_ADDR_MASK;
 		--iterator->level;
 		if (!iterator->shadow_addr)
@@ -2551,7 +2487,7 @@ static bool mmu_need_write_protect(struct vmrun_vcpu *vcpu, gfn_t gfn,
 {
 	struct vmrun_mmu_page *sp;
 
-	if (vmrun_page_track_is_active(vcpu, gfn, KVM_PAGE_TRACK_WRITE))
+	if (vmrun_page_track_is_active(vcpu, gfn, VMRUN_PAGE_TRACK_WRITE))
 		return true;
 
 	for_each_gfn_indirect_valid_sp(vcpu->vmrun, sp, gfn) {
@@ -2708,7 +2644,7 @@ static bool mmu_set_spte(struct vmrun_vcpu *vcpu, u64 *sptep, unsigned pte_acces
 	      true, host_writable)) {
 		if (write_fault)
 			emulate = true;
-		vmrun_make_request(KVM_REQ_TLB_FLUSH, vcpu);
+		vmrun_make_request(VMRUN_REQ_TLB_FLUSH, vcpu);
 	}
 
 	if (unlikely(is_mmio_spte(*sptep)))
@@ -2742,7 +2678,7 @@ static vmrun_pfn_t pte_prefetch_gfn_to_pfn(struct vmrun_vcpu *vcpu, gfn_t gfn,
 
 	slot = gfn_to_memslot_dirty_bitmap(vcpu, gfn, no_dirty_log);
 	if (!slot)
-		return KVM_PFN_ERR_FAULT;
+		return VMRUN_PFN_ERR_FAULT;
 
 	return gfn_to_pfn_memslot_atomic(slot, gfn);
 }
@@ -2873,10 +2809,10 @@ static int vmrun_handle_bad_page(struct vmrun_vcpu *vcpu, gfn_t gfn, vmrun_pfn_t
 	 * caused mmio page fault and treat it as mmio access.
 	 * Return 1 to tell vmrun to emulate it.
 	 */
-	if (pfn == KVM_PFN_ERR_RO_FAULT)
+	if (pfn == VMRUN_PFN_ERR_RO_FAULT)
 		return 1;
 
-	if (pfn == KVM_PFN_ERR_HWPOISON) {
+	if (pfn == VMRUN_PFN_ERR_HWPOISON) {
 		vmrun_send_hwpoison_signal(vmrun_vcpu_gfn_to_hva(vcpu, gfn), current);
 		return 0;
 	}
@@ -2913,7 +2849,7 @@ static void transparent_hugepage_adjust(struct vmrun_vcpu *vcpu,
 		 * head.
 		 */
 		*levelp = level = PT_DIRECTORY_LEVEL;
-		mask = KVM_PAGES_PER_HPAGE(level) - 1;
+		mask = VMRUN_PAGES_PER_HPAGE(level) - 1;
 		VM_BUG_ON((gfn & mask) != (pfn & mask));
 		if (pfn & mask) {
 			gfn &= ~mask;
@@ -3159,7 +3095,7 @@ static int nonpaging_map(struct vmrun_vcpu *vcpu, gva_t v, u32 error_code,
 		if (level > PT_DIRECTORY_LEVEL)
 			level = PT_DIRECTORY_LEVEL;
 
-		gfn &= ~(KVM_PAGES_PER_HPAGE(level) - 1);
+		gfn &= ~(VMRUN_PAGES_PER_HPAGE(level) - 1);
 	}
 
 	if (fast_page_fault(vcpu, v, level, error_code))
@@ -3199,13 +3135,13 @@ static void mmu_free_roots(struct vmrun_vcpu *vcpu)
 	struct vmrun_mmu_page *sp;
 	LIST_HEAD(invalid_list);
 
-	if (!VALID_PAGE(vcpu->arch.mmu.root_hpa))
+	if (!VALID_PAGE(vcpu->mmu.root_hpa))
 		return;
 
-	if (vcpu->arch.mmu.shadow_root_level >= PT64_ROOT_4LEVEL &&
-	    (vcpu->arch.mmu.root_level >= PT64_ROOT_4LEVEL ||
-	     vcpu->arch.mmu.direct_map)) {
-		hpa_t root = vcpu->arch.mmu.root_hpa;
+	if (vcpu->mmu.shadow_root_level >= PT64_ROOT_4LEVEL &&
+	    (vcpu->mmu.root_level >= PT64_ROOT_4LEVEL ||
+	     vcpu->mmu.direct_map)) {
+		hpa_t root = vcpu->mmu.root_hpa;
 
 		spin_lock(&vcpu->vmrun->mmu_lock);
 		sp = page_header(root);
@@ -3215,13 +3151,13 @@ static void mmu_free_roots(struct vmrun_vcpu *vcpu)
 			vmrun_mmu_commit_zap_page(vcpu->vmrun, &invalid_list);
 		}
 		spin_unlock(&vcpu->vmrun->mmu_lock);
-		vcpu->arch.mmu.root_hpa = INVALID_PAGE;
+		vcpu->mmu.root_hpa = INVALID_PAGE;
 		return;
 	}
 
 	spin_lock(&vcpu->vmrun->mmu_lock);
 	for (i = 0; i < 4; ++i) {
-		hpa_t root = vcpu->arch.mmu.pae_root[i];
+		hpa_t root = vcpu->mmu.pae_root[i];
 
 		if (root) {
 			root &= PT64_BASE_ADDR_MASK;
@@ -3231,11 +3167,11 @@ static void mmu_free_roots(struct vmrun_vcpu *vcpu)
 				vmrun_mmu_prepare_zap_page(vcpu->vmrun, sp,
 							 &invalid_list);
 		}
-		vcpu->arch.mmu.pae_root[i] = INVALID_PAGE;
+		vcpu->mmu.pae_root[i] = INVALID_PAGE;
 	}
 	vmrun_mmu_commit_zap_page(vcpu->vmrun, &invalid_list);
 	spin_unlock(&vcpu->vmrun->mmu_lock);
-	vcpu->arch.mmu.root_hpa = INVALID_PAGE;
+	vcpu->mmu.root_hpa = INVALID_PAGE;
 }
 
 static int mmu_check_root(struct vmrun_vcpu *vcpu, gfn_t root_gfn)
@@ -3255,20 +3191,20 @@ static int mmu_alloc_direct_roots(struct vmrun_vcpu *vcpu)
 	struct vmrun_mmu_page *sp;
 	unsigned i;
 
-	if (vcpu->arch.mmu.shadow_root_level >= PT64_ROOT_4LEVEL) {
+	if (vcpu->mmu.shadow_root_level >= PT64_ROOT_4LEVEL) {
 		spin_lock(&vcpu->vmrun->mmu_lock);
 		if(make_mmu_pages_available(vcpu) < 0) {
 			spin_unlock(&vcpu->vmrun->mmu_lock);
 			return 1;
 		}
 		sp = vmrun_mmu_get_page(vcpu, 0, 0,
-				vcpu->arch.mmu.shadow_root_level, 1, ACC_ALL);
+				vcpu->mmu.shadow_root_level, 1, ACC_ALL);
 		++sp->root_count;
 		spin_unlock(&vcpu->vmrun->mmu_lock);
-		vcpu->arch.mmu.root_hpa = __pa(sp->spt);
-	} else if (vcpu->arch.mmu.shadow_root_level == PT32E_ROOT_LEVEL) {
+		vcpu->mmu.root_hpa = __pa(sp->spt);
+	} else if (vcpu->mmu.shadow_root_level == PT32E_ROOT_LEVEL) {
 		for (i = 0; i < 4; ++i) {
-			hpa_t root = vcpu->arch.mmu.pae_root[i];
+			hpa_t root = vcpu->mmu.pae_root[i];
 
 			MMU_WARN_ON(VALID_PAGE(root));
 			spin_lock(&vcpu->vmrun->mmu_lock);
@@ -3281,9 +3217,9 @@ static int mmu_alloc_direct_roots(struct vmrun_vcpu *vcpu)
 			root = __pa(sp->spt);
 			++sp->root_count;
 			spin_unlock(&vcpu->vmrun->mmu_lock);
-			vcpu->arch.mmu.pae_root[i] = root | PT_PRESENT_MASK;
+			vcpu->mmu.pae_root[i] = root | PT_PRESENT_MASK;
 		}
-		vcpu->arch.mmu.root_hpa = __pa(vcpu->arch.mmu.pae_root);
+		vcpu->mmu.root_hpa = __pa(vcpu->mmu.pae_root);
 	} else
 		BUG();
 
@@ -3393,10 +3329,11 @@ static int mmu_alloc_shadow_roots(struct vmrun_vcpu *vcpu)
 
 static int mmu_alloc_roots(struct vmrun_vcpu *vcpu)
 {
-	if (vcpu->arch.mmu.direct_map)
+	if (vcpu->mmu.direct_map)
 		return mmu_alloc_direct_roots(vcpu);
 	else
-		return mmu_alloc_shadow_roots(vcpu);
+		BUG();
+		// return mmu_alloc_shadow_roots(vcpu);
 }
 
 static void mmu_sync_roots(struct vmrun_vcpu *vcpu)
@@ -3404,23 +3341,23 @@ static void mmu_sync_roots(struct vmrun_vcpu *vcpu)
 	int i;
 	struct vmrun_mmu_page *sp;
 
-	if (vcpu->arch.mmu.direct_map)
+	if (vcpu->mmu.direct_map)
 		return;
 
-	if (!VALID_PAGE(vcpu->arch.mmu.root_hpa))
+	if (!VALID_PAGE(vcpu->mmu.root_hpa))
 		return;
 
 	vcpu_clear_mmio_info(vcpu, MMIO_GVA_ANY);
 	vmrun_mmu_audit(vcpu, AUDIT_PRE_SYNC);
-	if (vcpu->arch.mmu.root_level >= PT64_ROOT_4LEVEL) {
-		hpa_t root = vcpu->arch.mmu.root_hpa;
+	if (vcpu->mmu.root_level >= PT64_ROOT_4LEVEL) {
+		hpa_t root = vcpu->mmu.root_hpa;
 		sp = page_header(root);
 		mmu_sync_children(vcpu, sp);
 		vmrun_mmu_audit(vcpu, AUDIT_POST_SYNC);
 		return;
 	}
 	for (i = 0; i < 4; ++i) {
-		hpa_t root = vcpu->arch.mmu.pae_root[i];
+		hpa_t root = vcpu->mmu.pae_root[i];
 
 		if (root && VALID_PAGE(root)) {
 			root &= PT64_BASE_ADDR_MASK;
@@ -3437,7 +3374,6 @@ void vmrun_mmu_sync_roots(struct vmrun_vcpu *vcpu)
 	mmu_sync_roots(vcpu);
 	spin_unlock(&vcpu->vmrun->mmu_lock);
 }
-EXPORT_SYMBOL_GPL(vmrun_mmu_sync_roots);
 
 static gpa_t nonpaging_gva_to_gpa(struct vmrun_vcpu *vcpu, gva_t vaddr,
 				  u32 access, struct x86_exception *exception)
@@ -3601,7 +3537,7 @@ static bool page_fault_handle_page_track(struct vmrun_vcpu *vcpu,
 	 * guest is writing the page which is write tracked which can
 	 * not be fixed by page fault handler.
 	 */
-	if (vmrun_page_track_is_active(vcpu, gfn, KVM_PAGE_TRACK_WRITE))
+	if (vmrun_page_track_is_active(vcpu, gfn, VMRUN_PAGE_TRACK_WRITE))
 		return true;
 
 	return false;
@@ -3639,7 +3575,7 @@ static int nonpaging_page_fault(struct vmrun_vcpu *vcpu, gva_t gva,
 	if (r)
 		return r;
 
-	MMU_WARN_ON(!VALID_PAGE(vcpu->arch.mmu.root_hpa));
+	MMU_WARN_ON(!VALID_PAGE(vcpu->mmu.root_hpa));
 
 
 	return nonpaging_map(vcpu, gva & PAGE_MASK,
@@ -3726,12 +3662,11 @@ int vmrun_handle_page_fault(struct vmrun_vcpu *vcpu, u64 error_code,
 	}
 	return r;
 }
-EXPORT_SYMBOL_GPL(vmrun_handle_page_fault);
 
 static bool
 check_hugepage_cache_consistency(struct vmrun_vcpu *vcpu, gfn_t gfn, int level)
 {
-	int page_num = KVM_PAGES_PER_HPAGE(level);
+	int page_num = VMRUN_PAGES_PER_HPAGE(level);
 
 	gfn &= ~(page_num - 1);
 
@@ -3750,29 +3685,33 @@ static int tdp_page_fault(struct vmrun_vcpu *vcpu, gva_t gpa, u32 error_code,
 	int write = error_code & PFERR_WRITE_MASK;
 	bool map_writable;
 
-	MMU_WARN_ON(!VALID_PAGE(vcpu->arch.mmu.root_hpa));
+	MMU_WARN_ON(!VALID_PAGE(vcpu->mmu.root_hpa));
 
 	if (page_fault_handle_page_track(vcpu, error_code, gfn))
 		return 1;
 
 	r = mmu_topup_memory_caches(vcpu);
+	
 	if (r)
 		return r;
 
 	force_pt_level = !check_hugepage_cache_consistency(vcpu, gfn,
 							   PT_DIRECTORY_LEVEL);
+	
 	level = mapping_level(vcpu, gfn, &force_pt_level);
+	
 	if (likely(!force_pt_level)) {
 		if (level > PT_DIRECTORY_LEVEL &&
 		    !check_hugepage_cache_consistency(vcpu, gfn, level))
 			level = PT_DIRECTORY_LEVEL;
-		gfn &= ~(KVM_PAGES_PER_HPAGE(level) - 1);
+		gfn &= ~(VMRUN_PAGES_PER_HPAGE(level) - 1);
 	}
 
 	if (fast_page_fault(vcpu, gpa, level, error_code))
 		return 0;
 
 	mmu_seq = vcpu->vmrun->mmu_notifier_seq;
+	
 	smp_rmb();
 
 	if (try_async_pf(vcpu, prefault, gfn, gpa, &pfn, write, &map_writable))
@@ -3782,20 +3721,27 @@ static int tdp_page_fault(struct vmrun_vcpu *vcpu, gva_t gpa, u32 error_code,
 		return r;
 
 	spin_lock(&vcpu->vmrun->mmu_lock);
+	
 	if (mmu_notifier_retry(vcpu->vmrun, mmu_seq))
 		goto out_unlock;
+	
 	if (make_mmu_pages_available(vcpu) < 0)
 		goto out_unlock;
+	
 	if (likely(!force_pt_level))
 		transparent_hugepage_adjust(vcpu, &gfn, &pfn, &level);
+	
 	r = __direct_map(vcpu, write, map_writable, level, gfn, pfn, prefault);
+	
 	spin_unlock(&vcpu->vmrun->mmu_lock);
 
 	return r;
 
 out_unlock:
 	spin_unlock(&vcpu->vmrun->mmu_lock);
+	
 	vmrun_release_pfn_clean(pfn);
+	
 	return 0;
 }
 
@@ -3824,29 +3770,6 @@ static unsigned long get_cr3(struct vmrun_vcpu *vcpu)
 	return vmrun_read_cr3(vcpu);
 }
 
-static void inject_page_fault(struct vmrun_vcpu *vcpu,
-			      struct x86_exception *fault)
-{
-	vcpu->arch.mmu.inject_page_fault(vcpu, fault);
-}
-
-static bool sync_mmio_spte(struct vmrun_vcpu *vcpu, u64 *sptep, gfn_t gfn,
-			   unsigned access, int *nr_present)
-{
-	if (unlikely(is_mmio_spte(*sptep))) {
-		if (gfn != get_mmio_spte_gfn(*sptep)) {
-			mmu_spte_clear_no_track(sptep);
-			return true;
-		}
-
-		(*nr_present)++;
-		mark_mmio_spte(vcpu, sptep, gfn, access);
-		return true;
-	}
-
-	return false;
-}
-
 static inline bool is_last_gpte(struct vmrun_mmu *mmu,
 				unsigned level, unsigned gpte)
 {
@@ -3867,10 +3790,10 @@ static inline bool is_last_gpte(struct vmrun_mmu *mmu,
 	return gpte & PT_PAGE_SIZE_MASK;
 }
 
-#define PTTYPE_EPT 18 /* arbitrary */
-#define PTTYPE PTTYPE_EPT
-#include "paging_tmpl.h"
-#undef PTTYPE
+//#define PTTYPE_EPT 18 /* arbitrary */
+//#define PTTYPE PTTYPE_EPT
+//#include "paging_tmpl.h"
+//#undef PTTYPE
 
 #define PTTYPE 64
 #include "paging_tmpl.h"
@@ -4017,7 +3940,7 @@ __reset_rsvds_bits_mask_ept(struct rsvd_bits_validate *rsvd_check,
 }
 
 static void reset_rsvds_bits_mask_ept(struct vmrun_vcpu *vcpu,
-		struct vmrun_mmu *context, bool execonly)
+				      struct vmrun_mmu *context, bool execonly)
 {
 	__reset_rsvds_bits_mask_ept(&context->guest_rsvd_check,
 				    cpuid_maxphyaddr(vcpu), execonly);
@@ -4190,81 +4113,6 @@ static void update_permission_bitmask(struct vmrun_vcpu *vcpu,
 	}
 }
 
-/*
-* PKU is an additional mechanism by which the paging controls access to
-* user-mode addresses based on the value in the PKRU register.  Protection
-* key violations are reported through a bit in the page fault error code.
-* Unlike other bits of the error code, the PK bit is not known at the
-* call site of e.g. gva_to_gpa; it must be computed directly in
-* permission_fault based on two bits of PKRU, on some machine state (CR4,
-* CR0, EFER, CPL), and on other bits of the error code and the page tables.
-*
-* In particular the following conditions come from the error code, the
-* page tables and the machine state:
-* - PK is always zero unless CR4.PKE=1 and EFER.LMA=1
-* - PK is always zero if RSVD=1 (reserved bit set) or F=1 (instruction fetch)
-* - PK is always zero if U=0 in the page tables
-* - PKRU.WD is ignored if CR0.WP=0 and the access is a supervisor access.
-*
-* The PKRU bitmask caches the result of these four conditions.  The error
-* code (minus the P bit) and the page table's U bit form an index into the
-* PKRU bitmask.  Two bits of the PKRU bitmask are then extracted and ANDed
-* with the two bits of the PKRU register corresponding to the protection key.
-* For the first three conditions above the bits will be 00, thus masking
-* away both AD and WD.  For all reads or if the last condition holds, WD
-* only will be masked away.
-*/
-static void update_pkru_bitmask(struct vmrun_vcpu *vcpu, struct vmrun_mmu *mmu,
-				bool ept)
-{
-	unsigned bit;
-	bool wp;
-
-	if (ept) {
-		mmu->pkru_mask = 0;
-		return;
-	}
-
-	/* PKEY is enabled only if CR4.PKE and EFER.LMA are both set. */
-	if (!vmrun_read_cr4_bits(vcpu, X86_CR4_PKE) || !is_long_mode(vcpu)) {
-		mmu->pkru_mask = 0;
-		return;
-	}
-
-	wp = is_write_protection(vcpu);
-
-	for (bit = 0; bit < ARRAY_SIZE(mmu->permissions); ++bit) {
-		unsigned pfec, pkey_bits;
-		bool check_pkey, check_write, ff, uf, wf, pte_user;
-
-		pfec = bit << 1;
-		ff = pfec & PFERR_FETCH_MASK;
-		uf = pfec & PFERR_USER_MASK;
-		wf = pfec & PFERR_WRITE_MASK;
-
-		/* PFEC.RSVD is replaced by ACC_USER_MASK. */
-		pte_user = pfec & PFERR_RSVD_MASK;
-
-		/*
-		 * Only need to check the access which is not an
-		 * instruction fetch and is to a user page.
-		 */
-		check_pkey = (!ff && pte_user);
-		/*
-		 * write access is controlled by PKRU if it is a
-		 * user access or CR0.WP = 1.
-		 */
-		check_write = check_pkey && wf && (uf || wp);
-
-		/* PKRU.AD stops both read and write access. */
-		pkey_bits = !!check_pkey;
-		/* PKRU.WD stops write access. */
-		pkey_bits |= (!!check_write) << 1;
-
-		mmu->pkru_mask |= (pkey_bits & 3) << pfec;
-	}
-}
-
 static void update_last_nonleaf_level(struct vmrun_vcpu *vcpu, struct vmrun_mmu *mmu)
 {
 	unsigned root_level = mmu->root_level;
@@ -4274,72 +4122,12 @@ static void update_last_nonleaf_level(struct vmrun_vcpu *vcpu, struct vmrun_mmu 
 		mmu->last_nonleaf_level++;
 }
 
-static void paging64_init_context_common(struct vmrun_vcpu *vcpu,
-					 struct vmrun_mmu *context,
-					 int level)
-{
-	context->nx = is_nx(vcpu);
-	context->root_level = level;
-
-	reset_rsvds_bits_mask(vcpu, context);
-	update_permission_bitmask(vcpu, context, false);
-	update_pkru_bitmask(vcpu, context, false);
-	update_last_nonleaf_level(vcpu, context);
-
-	MMU_WARN_ON(!is_pae(vcpu));
-	context->page_fault = paging64_page_fault;
-	context->gva_to_gpa = paging64_gva_to_gpa;
-	context->sync_page = paging64_sync_page;
-	context->invlpg = paging64_invlpg;
-	context->update_pte = paging64_update_pte;
-	context->shadow_root_level = level;
-	context->root_hpa = INVALID_PAGE;
-	context->direct_map = false;
-}
-
-static void paging64_init_context(struct vmrun_vcpu *vcpu,
-				  struct vmrun_mmu *context)
-{
-	int root_level = is_la57_mode(vcpu) ?
-			 PT64_ROOT_5LEVEL : PT64_ROOT_4LEVEL;
-
-	paging64_init_context_common(vcpu, context, root_level);
-}
-
-static void paging32_init_context(struct vmrun_vcpu *vcpu,
-				  struct vmrun_mmu *context)
-{
-	context->nx = false;
-	context->root_level = PT32_ROOT_LEVEL;
-
-	reset_rsvds_bits_mask(vcpu, context);
-	update_permission_bitmask(vcpu, context, false);
-	update_pkru_bitmask(vcpu, context, false);
-	update_last_nonleaf_level(vcpu, context);
-
-	context->page_fault = paging32_page_fault;
-	context->gva_to_gpa = paging32_gva_to_gpa;
-	context->sync_page = paging32_sync_page;
-	context->invlpg = paging32_invlpg;
-	context->update_pte = paging32_update_pte;
-	context->shadow_root_level = PT32E_ROOT_LEVEL;
-	context->root_hpa = INVALID_PAGE;
-	context->direct_map = false;
-}
-
-static void paging32E_init_context(struct vmrun_vcpu *vcpu,
-				   struct vmrun_mmu *context)
-{
-	paging64_init_context_common(vcpu, context, PT32E_ROOT_LEVEL);
-}
-
 static void init_vmrun_tdp_mmu(struct vmrun_vcpu *vcpu)
 {
-	struct vmrun_mmu *context = &vcpu->arch.mmu;
+	struct vmrun_mmu *context = &vcpu->mmu;
 
 	context->base_role.word = 0;
 	context->base_role.smm = is_smm(vcpu);
-	context->base_role.ad_disabled = (shadow_accessed_mask == 0);
 	context->page_fault = tdp_page_fault;
 	context->sync_page = nonpaging_sync_page;
 	context->invlpg = nonpaging_invlpg;
@@ -4347,22 +4135,22 @@ static void init_vmrun_tdp_mmu(struct vmrun_vcpu *vcpu)
 	context->shadow_root_level = vmrun_x86_ops->get_tdp_level(vcpu);
 	context->root_hpa = INVALID_PAGE;
 	context->direct_map = true;
-	context->set_cr3 = vmrun_x86_ops->set_tdp_cr3;
+	context->set_cr3 = vmrun_set_tdp_cr3;
 	context->get_cr3 = get_cr3;
 	context->get_pdptr = vmrun_pdptr_read;
 	context->inject_page_fault = vmrun_inject_page_fault;
 
-	if (!is_paging(vcpu)) {
+	if (!vmrun_is_paging(vcpu)) {
 		context->nx = false;
 		context->gva_to_gpa = nonpaging_gva_to_gpa;
 		context->root_level = 0;
-	} else if (is_long_mode(vcpu)) {
+	} else if (vmrun_is_long_mode(vcpu)) {
 		context->nx = is_nx(vcpu);
-		context->root_level = is_la57_mode(vcpu) ?
+		context->root_level = vmrun_is_la57_mode(vcpu) ?
 				PT64_ROOT_5LEVEL : PT64_ROOT_4LEVEL;
 		reset_rsvds_bits_mask(vcpu, context);
 		context->gva_to_gpa = paging64_gva_to_gpa;
-	} else if (is_pae(vcpu)) {
+	} else if (vmrun_is_pae(vcpu)) {
 		context->nx = is_nx(vcpu);
 		context->root_level = PT32E_ROOT_LEVEL;
 		reset_rsvds_bits_mask(vcpu, context);
@@ -4493,12 +4281,8 @@ static void init_vmrun_nested_mmu(struct vmrun_vcpu *vcpu)
 
 static void init_vmrun_mmu(struct vmrun_vcpu *vcpu)
 {
-	if (mmu_is_nested(vcpu))
-		init_vmrun_nested_mmu(vcpu);
-	else if (tdp_enabled)
-		init_vmrun_tdp_mmu(vcpu);
-	else
-		init_vmrun_softmmu(vcpu);
+
+	init_vmrun_tdp_mmu(vcpu);
 }
 
 void vmrun_mmu_reset_context(struct vmrun_vcpu *vcpu)
@@ -4506,30 +4290,34 @@ void vmrun_mmu_reset_context(struct vmrun_vcpu *vcpu)
 	vmrun_mmu_unload(vcpu);
 	init_vmrun_mmu(vcpu);
 }
-EXPORT_SYMBOL_GPL(vmrun_mmu_reset_context);
 
 int vmrun_mmu_load(struct vmrun_vcpu *vcpu)
 {
 	int r;
 
 	r = mmu_topup_memory_caches(vcpu);
+
 	if (r)
 		goto out;
+
 	r = mmu_alloc_roots(vcpu);
+
 	vmrun_mmu_sync_roots(vcpu);
+
 	if (r)
 		goto out;
+
 	/* set_cr3() should ensure TLB has been flushed */
-	vcpu->arch.mmu.set_cr3(vcpu, vcpu->arch.mmu.root_hpa);
+	vcpu->mmu.set_cr3(vcpu, vcpu->mmu.root_hpa);
+
 out:
 	return r;
 }
-EXPORT_SYMBOL_GPL(vmrun_mmu_load);
 
 void vmrun_mmu_unload(struct vmrun_vcpu *vcpu)
 {
 	mmu_free_roots(vcpu);
-	WARN_ON(VALID_PAGE(vcpu->arch.mmu.root_hpa));
+	WARN_ON(VALID_PAGE(vcpu->mmu.root_hpa));
 }
 EXPORT_SYMBOL_GPL(vmrun_mmu_unload);
 
@@ -4672,8 +4460,8 @@ static u64 *get_written_sptes(struct vmrun_mmu_page *sp, gpa_t gpa, int *nspte)
 }
 
 static void vmrun_mmu_pte_write(struct vmrun_vcpu *vcpu, gpa_t gpa,
-			      const u8 *new, int bytes,
-			      struct vmrun_page_track_notifier_node *node)
+			        const u8 *new, int bytes,
+			        struct vmrun_page_track_notifier_node *node)
 {
 	gfn_t gfn = gpa >> PAGE_SHIFT;
 	struct vmrun_mmu_page *sp;
@@ -4732,7 +4520,7 @@ static void vmrun_mmu_pte_write(struct vmrun_vcpu *vcpu, gpa_t gpa,
 			entry = *spte;
 			mmu_page_zap_pte(vcpu->vmrun, sp, spte);
 			if (gentry &&
-			      !((sp->role.word ^ vcpu->arch.mmu.base_role.word)
+			      !((sp->role.word ^ vcpu->mmu.base_role.word)
 			      & mask.word) && rmap_can_add(vcpu))
 				mmu_pte_write_new_pte(vcpu, sp, spte, &gentry);
 			if (need_remote_flush(entry, *spte))
@@ -4750,7 +4538,7 @@ int vmrun_mmu_unprotect_page_virt(struct vmrun_vcpu *vcpu, gva_t gva)
 	gpa_t gpa;
 	int r;
 
-	if (vcpu->arch.mmu.direct_map)
+	if (vcpu->mmu.direct_map)
 		return 0;
 
 	gpa = vmrun_mmu_gva_to_gpa_read(vcpu, gva, NULL);
@@ -4765,10 +4553,10 @@ static int make_mmu_pages_available(struct vmrun_vcpu *vcpu)
 {
 	LIST_HEAD(invalid_list);
 
-	if (likely(vmrun_mmu_available_pages(vcpu->vmrun) >= KVM_MIN_FREE_MMU_PAGES))
+	if (likely(vmrun_mmu_available_pages(vcpu->vmrun) >= VMRUN_MIN_FREE_MMU_PAGES))
 		return 0;
 
-	while (vmrun_mmu_available_pages(vcpu->vmrun) < KVM_REFILL_PAGES) {
+	while (vmrun_mmu_available_pages(vcpu->vmrun) < VMRUN_REFILL_PAGES) {
 		if (!prepare_zap_oldest_mmu_page(vcpu->vmrun, &invalid_list))
 			break;
 
@@ -4786,12 +4574,12 @@ int vmrun_mmu_page_fault(struct vmrun_vcpu *vcpu, gva_t cr2, u64 error_code,
 {
 	int r, emulation_type = EMULTYPE_RETRY;
 	enum emulation_result er;
-	bool direct = vcpu->arch.mmu.direct_map;
+	bool direct = vcpu->mmu.direct_map;
 
 	/* With shadow page tables, fault_address contains a GVA or nGPA.  */
-	if (vcpu->arch.mmu.direct_map) {
-		vcpu->arch.gpa_available = true;
-		vcpu->arch.gpa_val = cr2;
+	if (vcpu->mmu.direct_map) {
+		vcpu->gpa_available = true;
+		vcpu->gpa_val = cr2;
 	}
 
 	if (unlikely(error_code & PFERR_RSVD_MASK)) {
@@ -4807,7 +4595,7 @@ int vmrun_mmu_page_fault(struct vmrun_vcpu *vcpu, gva_t cr2, u64 error_code,
 		/* Must be RET_MMIO_PF_INVALID.  */
 	}
 
-	r = vcpu->arch.mmu.page_fault(vcpu, cr2, lower_32_bits(error_code),
+	r = vcpu->mmu.page_fault(vcpu, cr2, lower_32_bits(error_code),
 				      false);
 	if (r < 0)
 		return r;
@@ -4821,7 +4609,7 @@ int vmrun_mmu_page_fault(struct vmrun_vcpu *vcpu, gva_t cr2, u64 error_code,
 	 * paging in both guests. If true, we simply unprotect the page
 	 * and resume the guest.
 	 */
-	if (vcpu->arch.mmu.direct_map &&
+	if (vcpu->mmu.direct_map &&
 	    (error_code & PFERR_NESTED_GUEST_PAGE) == PFERR_NESTED_GUEST_PAGE) {
 		vmrun_mmu_unprotect_page(vcpu->vmrun, gpa_to_gfn(cr2));
 		return 1;
@@ -4848,29 +4636,16 @@ EXPORT_SYMBOL_GPL(vmrun_mmu_page_fault);
 
 void vmrun_mmu_invlpg(struct vmrun_vcpu *vcpu, gva_t gva)
 {
-	vcpu->arch.mmu.invlpg(vcpu, gva);
-	vmrun_make_request(KVM_REQ_TLB_FLUSH, vcpu);
+	vcpu->mmu.invlpg(vcpu, gva);
+	vmrun_make_request(VMRUN_REQ_TLB_FLUSH, vcpu);
 	++vcpu->stat.invlpg;
 }
-EXPORT_SYMBOL_GPL(vmrun_mmu_invlpg);
-
-void vmrun_enable_tdp(void)
-{
-	tdp_enabled = true;
-}
-EXPORT_SYMBOL_GPL(vmrun_enable_tdp);
-
-void vmrun_disable_tdp(void)
-{
-	tdp_enabled = false;
-}
-EXPORT_SYMBOL_GPL(vmrun_disable_tdp);
 
 static void free_mmu_pages(struct vmrun_vcpu *vcpu)
 {
-	free_page((unsigned long)vcpu->arch.mmu.pae_root);
-	if (vcpu->arch.mmu.lm_root != NULL)
-		free_page((unsigned long)vcpu->arch.mmu.lm_root);
+	free_page((unsigned long)vcpu->mmu.pae_root);
+	if (vcpu->mmu.lm_root != NULL)
+		free_page((unsigned long)vcpu->mmu.lm_root);
 }
 
 static int alloc_mmu_pages(struct vmrun_vcpu *vcpu)
@@ -4884,29 +4659,30 @@ static int alloc_mmu_pages(struct vmrun_vcpu *vcpu)
 	 * 4GB of memory, which happens to fit the DMA32 zone.
 	 */
 	page = alloc_page(GFP_KERNEL | __GFP_DMA32);
+	
 	if (!page)
 		return -ENOMEM;
 
-	vcpu->arch.mmu.pae_root = page_address(page);
+	vcpu->mmu.pae_root = page_address(page);
 	for (i = 0; i < 4; ++i)
-		vcpu->arch.mmu.pae_root[i] = INVALID_PAGE;
+		vcpu->mmu.pae_root[i] = INVALID_PAGE;
 
 	return 0;
 }
 
 int vmrun_mmu_create(struct vmrun_vcpu *vcpu)
 {
-	vcpu->arch.walk_mmu = &vcpu->arch.mmu;
-	vcpu->arch.mmu.root_hpa = INVALID_PAGE;
-	vcpu->arch.mmu.translate_gpa = translate_gpa;
-	vcpu->arch.nested_mmu.translate_gpa = translate_nested_gpa;
+	vcpu->walk_mmu = &vcpu->mmu;
+	vcpu->mmu.root_hpa = INVALID_PAGE;
+	vcpu->mmu.translate_gpa = translate_gpa;
+	vcpu->nested_mmu.translate_gpa = translate_nested_gpa;
 
 	return alloc_mmu_pages(vcpu);
 }
 
 void vmrun_mmu_setup(struct vmrun_vcpu *vcpu)
 {
-	MMU_WARN_ON(VALID_PAGE(vcpu->arch.mmu.root_hpa));
+	MMU_WARN_ON(VALID_PAGE(vcpu->mmu.root_hpa));
 
 	init_vmrun_mmu(vcpu);
 }
@@ -4920,7 +4696,7 @@ static void vmrun_mmu_invalidate_zap_pages_in_memslot(struct vmrun *vmrun,
 
 void vmrun_mmu_init_vm(struct vmrun *vmrun)
 {
-	struct vmrun_page_track_notifier_node *node = &vmrun->arch.mmu_sp_tracker;
+	struct vmrun_page_track_notifier_node *node = &vmrun->mmu_sp_tracker;
 
 	node->track_write = vmrun_mmu_pte_write;
 	node->track_flush_slot = vmrun_mmu_invalidate_zap_pages_in_memslot;
@@ -4929,7 +4705,7 @@ void vmrun_mmu_init_vm(struct vmrun *vmrun)
 
 void vmrun_mmu_uninit_vm(struct vmrun *vmrun)
 {
-	struct vmrun_page_track_notifier_node *node = &vmrun->arch.mmu_sp_tracker;
+	struct vmrun_page_track_notifier_node *node = &vmrun->mmu_sp_tracker;
 
 	vmrun_page_track_unregister_notifier(vmrun, node);
 }
@@ -5010,7 +4786,7 @@ void vmrun_zap_gfn_range(struct vmrun *vmrun, gfn_t gfn_start, gfn_t gfn_end)
 	int i;
 
 	spin_lock(&vmrun->mmu_lock);
-	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
+	for (i = 0; i < VMRUN_ADDRESS_SPACE_NUM; i++) {
 		slots = __vmrun_memslots(vmrun, i);
 		vmrun_for_each_memslot(memslot, slots) {
 			gfn_t start, end;
@@ -5130,7 +4906,6 @@ void vmrun_mmu_slot_leaf_clear_dirty(struct vmrun *vmrun,
 	if (flush)
 		vmrun_flush_remote_tlbs(vmrun);
 }
-EXPORT_SYMBOL_GPL(vmrun_mmu_slot_leaf_clear_dirty);
 
 void vmrun_mmu_slot_largepage_remove_write_access(struct vmrun *vmrun,
 					struct vmrun_memory_slot *memslot)
@@ -5148,7 +4923,6 @@ void vmrun_mmu_slot_largepage_remove_write_access(struct vmrun *vmrun,
 	if (flush)
 		vmrun_flush_remote_tlbs(vmrun);
 }
-EXPORT_SYMBOL_GPL(vmrun_mmu_slot_largepage_remove_write_access);
 
 void vmrun_mmu_slot_set_dirty(struct vmrun *vmrun,
 			    struct vmrun_memory_slot *memslot)
@@ -5165,7 +4939,6 @@ void vmrun_mmu_slot_set_dirty(struct vmrun *vmrun,
 	if (flush)
 		vmrun_flush_remote_tlbs(vmrun);
 }
-EXPORT_SYMBOL_GPL(vmrun_mmu_slot_set_dirty);
 
 #define BATCH_ZAP_PAGES	10
 static void vmrun_zap_obsolete_pages(struct vmrun *vmrun)
@@ -5175,7 +4948,7 @@ static void vmrun_zap_obsolete_pages(struct vmrun *vmrun)
 
 restart:
 	list_for_each_entry_safe_reverse(sp, node,
-	      &vmrun->arch.active_mmu_pages, link) {
+	      &vmrun->active_mmu_pages, link) {
 		int ret;
 
 		/*
@@ -5204,7 +4977,7 @@ restart:
 		}
 
 		ret = vmrun_mmu_prepare_zap_page(vmrun, sp,
-				&vmrun->arch.zapped_obsolete_pages);
+				&vmrun->zapped_obsolete_pages);
 		batch += ret;
 
 		if (ret)
@@ -5250,20 +5023,9 @@ void vmrun_mmu_invalidate_zap_all_pages(struct vmrun *vmrun)
 
 static bool vmrun_has_zapped_obsolete_pages(struct vmrun *vmrun)
 {
-	return unlikely(!list_empty_careful(&vmrun->arch.zapped_obsolete_pages));
+	return unlikely(!list_empty_careful(&vmrun->zapped_obsolete_pages));
 }
 
-void vmrun_mmu_invalidate_mmio_sptes(struct vmrun *vmrun, struct vmrun_memslots *slots)
-{
-	/*
-	 * The very rare case: if the generation-number is round,
-	 * zap all shadow pages.
-	 */
-	if (unlikely((slots->generation & MMIO_GEN_MASK) == 0)) {
-		vmrun_debug_ratelimited("vmrun: zapping shadow pages for mmio generation wraparound\n");
-		vmrun_mmu_invalidate_zap_all_pages(vmrun);
-	}
-}
 
 static unsigned long
 mmu_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
@@ -5292,7 +5054,7 @@ mmu_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
 		 * want to shrink a VM that only started to populate its MMU
 		 * anyway.
 		 */
-		if (!vmrun->arch.n_used_mmu_pages &&
+		if (!vmrun->n_used_mmu_pages &&
 		      !vmrun_has_zapped_obsolete_pages(vmrun))
 			continue;
 
@@ -5301,12 +5063,13 @@ mmu_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
 
 		if (vmrun_has_zapped_obsolete_pages(vmrun)) {
 			vmrun_mmu_commit_zap_page(vmrun,
-			      &vmrun->arch.zapped_obsolete_pages);
+			      &vmrun->zapped_obsolete_pages);
 			goto unlock;
 		}
 
 		if (prepare_zap_oldest_mmu_page(vmrun, &invalid_list))
 			freed++;
+		
 		vmrun_mmu_commit_zap_page(vmrun, &invalid_list);
 
 unlock:
@@ -5385,16 +5148,16 @@ unsigned int vmrun_mmu_calculate_mmu_pages(struct vmrun *vmrun)
 	struct vmrun_memory_slot *memslot;
 	int i;
 
-	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
+	for (i = 0; i < VMRUN_ADDRESS_SPACE_NUM; i++) {
 		slots = __vmrun_memslots(vmrun, i);
 
 		vmrun_for_each_memslot(memslot, slots)
 			nr_pages += memslot->npages;
 	}
 
-	nr_mmu_pages = nr_pages * KVM_PERMILLE_MMU_PAGES / 1000;
+	nr_mmu_pages = nr_pages * VMRUN_PERMILLE_MMU_PAGES / 1000;
 	nr_mmu_pages = max(nr_mmu_pages,
-			   (unsigned int) KVM_MIN_ALLOC_MMU_PAGES);
+			   (unsigned int) VMRUN_MIN_ALLOC_MMU_PAGES);
 
 	return nr_mmu_pages;
 }
@@ -5411,5 +5174,4 @@ void vmrun_mmu_module_exit(void)
 	mmu_destroy_caches();
 	percpu_counter_destroy(&vmrun_total_used_mmu_pages);
 	unregister_shrinker(&mmu_shrinker);
-	mmu_audit_disable();
 }

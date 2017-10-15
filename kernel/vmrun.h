@@ -66,6 +66,8 @@
 #define HF_SMM_MASK		  (1 << 6)
 #define V_INTR_MASK               (1 << 24)
 
+#define vmrun_arch_vcpu_memslots_id(vcpu) ((vcpu)->hflags & HF_SMM_MASK ? 1 : 0)
+
 #define IOPM_ALLOC_ORDER          2
 
 #define SEG_TYPE_LDT              2
@@ -87,6 +89,16 @@
 #define VMRUN_HPAGE_SHIFT(x)	 (PAGE_SHIFT + VMRUN_HPAGE_GFN_SHIFT(x))
 #define VMRUN_HPAGE_SIZE(x)	 (1UL << VMRUN_HPAGE_SHIFT(x))
 #define VMRUN_PAGES_PER_HPAGE(x) (VMRUN_HPAGE_SIZE(x) / PAGE_SIZE)
+
+#define VMRUN_PERMILLE_MMU_PAGES 20
+#define VMRUN_MIN_ALLOC_MMU_PAGES 64
+#define VMRUN_MMU_HASH_SHIFT 12
+#define VMRUN_NUM_MMU_PAGES (1 << VMRUN_MMU_HASH_SHIFT)
+#define VMRUN_MIN_FREE_MMU_PAGES 5
+#define VMRUN_REFILL_PAGES 25
+#define VMRUN_MAX_CPUID_ENTRIES 80
+#define VMRUN_NR_FIXED_MTRR_REGION 88
+#define VMRUN_NR_VAR_MTRR 8
 
 /*
  * The bit 16 ~ bit 31 of vmrun_memory_region::flags are internally used
@@ -223,15 +235,48 @@ struct vmrun_cpu_data {
 
 struct vmrun_vcpu;
 
+union vmrun_mmu_page_role {
+	unsigned word;
+	struct {
+		unsigned level:4;
+		unsigned cr4_pae:1;
+		unsigned quadrant:2;
+		unsigned direct:1;
+		unsigned access:3;
+		unsigned invalid:1;
+		unsigned nxe:1;
+		unsigned cr0_wp:1;
+		unsigned smep_andnot_wp:1;
+		unsigned smap_andnot_wp:1;
+		unsigned :8;
+
+		/*
+		 * This is left at the top of the word so that
+		 * vmrun_memslots_for_spte_role can extract it with a
+		 * simple shift.  While there is room, give it a whole
+		 * byte so it is also faster to load it from memory.
+		 */
+		unsigned smm:8;
+	};
+};
+
 struct vmrun_mmu {
-	void (*new_cr3)(struct vmrun_vcpu *vcpu);
-	int (*page_fault)(struct vmrun_vcpu *vcpu, gva_t gva, u32 err);
-	void (*inval_page)(struct vmrun_vcpu *vcpu, gva_t gva);
-	void (*free)(struct vmrun_vcpu *vcpu);
-	gpa_t (*gva_to_gpa)(struct vmrun_vcpu *vcpu, gva_t gva);
+	void (*set_cr3)(struct vmrun_vcpu *vcpu, unsigned long root);
+	unsigned long (*get_cr3)(struct vmrun_vcpu *vcpu);
+	u64 (*get_pdptr)(struct vmrun_vcpu *vcpu, int index);
+	int (*page_fault)(struct vmrun_vcpu *vcpu, gva_t gva, u32 err, bool prefault);
+	void (*inject_page_fault)(struct vmrun_vcpu *vcpu, struct x86_exception *fault);
+	gpa_t (*gva_to_gpa)(struct vmrun_vcpu *vcpu, gva_t gva, u32 access, struct x86_exception *exception);
+	gpa_t (*translate_gpa)(struct vmrun_vcpu *vcpu, gpa_t gpa, u32 access, struct x86_exception *exception);
+	int (*sync_page)(struct vmrun_vcpu *vcpu, struct vmrun_mmu_page *sp);
+	void (*invlpg)(struct vmrun_vcpu *vcpu, gva_t gva);
+	void (*update_pte)(struct vmrun_vcpu *vcpu, struct vmrun_mmu_page *sp, u64 *spte, const void *pte);
+
 	hpa_t root_hpa;
 	int root_level;
 	int shadow_root_level;
+	union vmrun_mmu_page_role base_role;
+	bool direct_map;
 
 	/*
 	 * Bitmap; bit set = permission fault
@@ -239,6 +284,8 @@ struct vmrun_mmu {
 	 * Bit index: pte permissions in ACC_* format
 	 */
 	u8 permissions[16];
+
+	bool nx;
 };
 
 
@@ -387,6 +434,18 @@ struct vmrun {
 	unsigned int n_used_mmu_pages;
 	unsigned int n_requested_mmu_pages;
 	unsigned int n_max_mmu_pages;
+	unsigned int indirect_shadow_pages;
+	unsigned long mmu_valid_gen;
+	struct hlist_head mmu_page_hash[VMRUN_NUM_MMU_PAGES];
+
+	/*
+	 * Hash table of struct kvm_mmu_page.
+	 */
+	struct list_head active_mmu_pages;
+	struct list_head zapped_obsolete_pages;
+	struct vmrun_page_track_notifier_node mmu_sp_tracker;
+	struct vmrun_page_track_notifier_head track_notifier_head;
+	struct list_head assigned_dev_head;
 
 	struct mmu_notifier mmu_notifier;
 	unsigned long mmu_notifier_seq;
@@ -394,11 +453,13 @@ struct vmrun {
 
 	long tlbs_dirty;
 	struct srcu_struct srcu;
-	struct list_head active_mmu_pages;
-	struct list_head zapped_obsolete_pages;
-	struct list_head assigned_dev_head;
 	atomic_t noncoherent_dma_count;
 	struct hlist_head mask_notifier_list; /* reads protected by irq_srcu, writes by irq_lock */
 };
+
+int vmrun_get_cpl(struct vmrun_vcpu *vcpu);
+unsigned long vmrun_get_rflags(struct vmrun_vcpu *vcpu);
+void vmrun_flush_remote_tlbs(struct vmrun *vmrun);
+struct vmrun_memory_slot *vmrun_vcpu_gfn_to_memslot(struct vmrun_vcpu *vcpu, gfn_t gfn);
 
 #endif // VMRUN_H

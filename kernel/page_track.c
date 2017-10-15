@@ -16,9 +16,10 @@
 #include <linux/rculist.h>
 #include "page_track.h"
 #include "mmu.h"
+#include "vmrun.h"
 
 void vmrun_page_track_free_memslot(struct vmrun_memory_slot *free,
-				 struct vmrun_memory_slot *dont)
+				   struct vmrun_memory_slot *dont)
 {
 	int i;
 
@@ -85,8 +86,9 @@ static void update_gfn_track(struct vmrun_memory_slot *slot, gfn_t gfn,
  * @mode: tracking mode, currently only write track is supported.
  */
 void vmrun_slot_page_track_add_page(struct vmrun *vmrun,
-				  struct vmrun_memory_slot *slot, gfn_t gfn,
-				  enum vmrun_page_track_mode mode)
+				    struct vmrun_memory_slot *slot,
+				    gfn_t gfn,
+				    enum vmrun_page_track_mode mode)
 {
 
 	if (WARN_ON(!page_track_mode_is_valid(mode)))
@@ -104,7 +106,6 @@ void vmrun_slot_page_track_add_page(struct vmrun *vmrun,
 		if (vmrun_mmu_slot_gfn_write_protect(vmrun, slot, gfn))
 			vmrun_flush_remote_tlbs(vmrun);
 }
-EXPORT_SYMBOL_GPL(vmrun_slot_page_track_add_page);
 
 /*
  * remove the guest page from the tracking pool which stops the interception
@@ -120,8 +121,8 @@ EXPORT_SYMBOL_GPL(vmrun_slot_page_track_add_page);
  * @mode: tracking mode, currently only write track is supported.
  */
 void vmrun_slot_page_track_remove_page(struct vmrun *vmrun,
-				     struct vmrun_memory_slot *slot, gfn_t gfn,
-				     enum vmrun_page_track_mode mode)
+				       struct vmrun_memory_slot *slot, gfn_t gfn,
+				       enum vmrun_page_track_mode mode)
 {
 	if (WARN_ON(!page_track_mode_is_valid(mode)))
 		return;
@@ -134,13 +135,12 @@ void vmrun_slot_page_track_remove_page(struct vmrun *vmrun,
 	 */
 	vmrun_mmu_gfn_allow_lpage(slot, gfn);
 }
-EXPORT_SYMBOL_GPL(vmrun_slot_page_track_remove_page);
 
 /*
  * check if the corresponding access on the specified guest page is tracked.
  */
 bool vmrun_page_track_is_active(struct vmrun_vcpu *vcpu, gfn_t gfn,
-			      enum vmrun_page_track_mode mode)
+			        enum vmrun_page_track_mode mode)
 {
 	struct vmrun_memory_slot *slot;
 	int index;
@@ -152,7 +152,7 @@ bool vmrun_page_track_is_active(struct vmrun_vcpu *vcpu, gfn_t gfn,
 	if (!slot)
 		return false;
 
-	index = gfn_to_index(gfn, slot->base_gfn, PT_PAGE_TABLE_LEVEL);
+	index = vmrun_gfn_to_index(gfn, slot->base_gfn, PT_PAGE_TABLE_LEVEL);
 	return !!ACCESS_ONCE(slot->arch.gfn_track[mode][index]);
 }
 
@@ -160,7 +160,7 @@ void vmrun_page_track_cleanup(struct vmrun *vmrun)
 {
 	struct vmrun_page_track_notifier_head *head;
 
-	head = &vmrun->arch.track_notifier_head;
+	head = &vmrun->track_notifier_head;
 	cleanup_srcu_struct(&head->track_srcu);
 }
 
@@ -168,7 +168,7 @@ void vmrun_page_track_init(struct vmrun *vmrun)
 {
 	struct vmrun_page_track_notifier_head *head;
 
-	head = &vmrun->arch.track_notifier_head;
+	head = &vmrun->track_notifier_head;
 	init_srcu_struct(&head->track_srcu);
 	INIT_HLIST_HEAD(&head->track_notifier_list);
 }
@@ -179,17 +179,16 @@ void vmrun_page_track_init(struct vmrun *vmrun)
  */
 void
 vmrun_page_track_register_notifier(struct vmrun *vmrun,
-				 struct vmrun_page_track_notifier_node *n)
+				   struct vmrun_page_track_notifier_node *n)
 {
 	struct vmrun_page_track_notifier_head *head;
 
-	head = &vmrun->arch.track_notifier_head;
+	head = &vmrun->track_notifier_head;
 
 	spin_lock(&vmrun->mmu_lock);
 	hlist_add_head_rcu(&n->node, &head->track_notifier_list);
 	spin_unlock(&vmrun->mmu_lock);
 }
-EXPORT_SYMBOL_GPL(vmrun_page_track_register_notifier);
 
 /*
  * stop receiving the event interception. It is the opposed operation of
@@ -197,18 +196,17 @@ EXPORT_SYMBOL_GPL(vmrun_page_track_register_notifier);
  */
 void
 vmrun_page_track_unregister_notifier(struct vmrun *vmrun,
-				   struct vmrun_page_track_notifier_node *n)
+				     struct vmrun_page_track_notifier_node *n)
 {
 	struct vmrun_page_track_notifier_head *head;
 
-	head = &vmrun->arch.track_notifier_head;
+	head = &vmrun->track_notifier_head;
 
 	spin_lock(&vmrun->mmu_lock);
 	hlist_del_rcu(&n->node);
 	spin_unlock(&vmrun->mmu_lock);
 	synchronize_srcu(&head->track_srcu);
 }
-EXPORT_SYMBOL_GPL(vmrun_page_track_unregister_notifier);
 
 /*
  * Notify the node that write access is intercepted and write emulation is
@@ -217,14 +215,16 @@ EXPORT_SYMBOL_GPL(vmrun_page_track_unregister_notifier);
  * The node should figure out if the written page is the one that node is
  * interested in by itself.
  */
-void vmrun_page_track_write(struct vmrun_vcpu *vcpu, gpa_t gpa, const u8 *new,
-			  int bytes)
+void vmrun_page_track_write(struct vmrun_vcpu *vcpu,
+			    gpa_t gpa,
+			    const u8 *new,
+			    int bytes)
 {
 	struct vmrun_page_track_notifier_head *head;
 	struct vmrun_page_track_notifier_node *n;
 	int idx;
 
-	head = &vcpu->vmrun->arch.track_notifier_head;
+	head = &vcpu->vmrun->track_notifier_head;
 
 	if (hlist_empty(&head->track_notifier_list))
 		return;
@@ -249,7 +249,7 @@ void vmrun_page_track_flush_slot(struct vmrun *vmrun, struct vmrun_memory_slot *
 	struct vmrun_page_track_notifier_node *n;
 	int idx;
 
-	head = &vmrun->arch.track_notifier_head;
+	head = &vmrun->track_notifier_head;
 
 	if (hlist_empty(&head->track_notifier_list))
 		return;

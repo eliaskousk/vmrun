@@ -742,6 +742,67 @@ static void vmrun_set_rflags(struct vmrun_vcpu *vcpu, unsigned long rflags)
 	vcpu->vmcb->save.rflags = rflags;
 }
 
+static void vmrun_set_efer(struct vmrun_vcpu *vcpu, u64 efer)
+{
+	vcpu->efer = efer;
+	if (!npt_enabled && !(efer & EFER_LMA))
+		efer &= ~EFER_LME;
+
+	vcpu->vmcb->save.efer      = efer | EFER_SVME;
+	vcpu->vmcb->control.clean &= ~(1 << VMCB_CR);
+}
+
+void vmrun_get_cs_db_l_bits(struct vmrun_vcpu *vcpu, int *db, int *l)
+{
+	struct vmrun_segment cs;
+
+	vmrun_get_segment(vcpu, &cs, VCPU_SREG_CS);
+	*db = cs.db;
+	*l = cs.l;
+}
+
+static inline bool vmrun_is_protmode(struct kvm_vcpu *vcpu)
+{
+	return vmrun_read_cr0_bits(vcpu, X86_CR0_PE);
+}
+
+static inline int vmrun_is_long_mode(struct vmrun_vcpu *vcpu)
+{
+	return vcpu->efer & EFER_LMA;
+}
+
+static inline bool vmrun_is_64_bit_mode(struct vmrun_vcpu *vcpu)
+{
+	int cs_db, cs_l;
+
+	if (!vmrun_is_long_mode(vcpu))
+		return false;
+
+	vmrun_get_cs_db_l_bits(vcpu, &cs_db, &cs_l);
+
+	return cs_l;
+}
+
+static inline bool vmrun_is_la57_mode(struct vmrun_vcpu *vcpu)
+{
+	return (vcpu->efer & EFER_LMA) && vmrun_read_cr4_bits(vcpu, X86_CR4_LA57);
+}
+
+static inline int is_pae(struct kvm_vcpu *vcpu)
+{
+	return vmrun_read_cr4_bits(vcpu, X86_CR4_PAE);
+}
+
+static inline int is_pse(struct kvm_vcpu *vcpu)
+{
+	return vmrun_read_cr4_bits(vcpu, X86_CR4_PSE);
+}
+
+static inline int is_paging(struct kvm_vcpu *vcpu)
+{
+	return likely(vmrun_read_cr0_bits(vcpu, X86_CR0_PG));
+}
+
 static void vmrun_init_seg(struct vmcb_seg *seg)
 {
 	seg->selector = 0;
@@ -1810,15 +1871,6 @@ int vmrun_vcpu_ioctl_set_regs(struct vmrun_vcpu *vcpu, struct vmrun_regs *regs)
 	return 0;
 }
 
-void vmrun_get_cs_db_l_bits(struct vmrun_vcpu *vcpu, int *db, int *l)
-{
-	struct vmrun_segment cs;
-
-	vmrun_get_segment(vcpu, &cs, VCPU_SREG_CS);
-	*db = cs.db;
-	*l = cs.l;
-}
-
 int vmrun_vcpu_ioctl_get_sregs(struct vmrun_vcpu *vcpu,
 			       struct vmrun_sregs *sregs)
 {
@@ -1849,16 +1901,6 @@ int vmrun_vcpu_ioctl_get_sregs(struct vmrun_vcpu *vcpu,
 	sregs->efer = vcpu->efer;
 
 	return 0;
-}
-
-static void vmrun_set_efer(struct vmrun_vcpu *vcpu, u64 efer)
-{
-	vcpu->efer = efer;
-	if (!npt_enabled && !(efer & EFER_LMA))
-		efer &= ~EFER_LME;
-
-	vcpu->vmcb->save.efer      = efer | EFER_SVME;
-	vcpu->vmcb->control.clean &= ~(1 << VMCB_CR);
 }
 
 int vmrun_vcpu_ioctl_set_sregs(struct vmrun_vcpu *vcpu,
@@ -2181,8 +2223,32 @@ vcpu_decrement:
 	return r;
 }
 
+#define vmrun_for_each_memslot(memslot, slots)	\
+	for (memslot = &slots->memslots[0];	\
+	      memslot < slots->memslots + VMRUN_MEM_SLOTS_NUM && memslot->npages;\
+		memslot++)
+
+static inline struct vmrun_memslots *__vmrun_memslots(struct vmrun *vmrun, int as_id)
+{
+	return srcu_dereference_check(vmrun->memslots[as_id], &kvm->srcu,
+				      lockdep_is_held(&kvm->slots_lock) ||
+				      !refcount_read(&kvm->users_count));
+}
+
+static inline struct vmrun_memslots *vmrun_memslots(struct vmrun *vmrun)
+{
+	return __vmrun_memslots(vmrun, 0);
+}
+
+static inline struct vmrun_memslots *vmrun_vcpu_memslots(struct vmrun_vcpu *vcpu)
+{
+	int as_id = vmrun_arch_vcpu_memslots_id(vcpu);
+
+	return __vmrun_memslots(vcpu->vmrun, as_id);
+}
+
 static inline struct vmrun_memory_slot *
-id_to_memslot(struct vmrun_memslots *slots, int id)
+vmrun_id_to_memslot(struct vmrun_memslots *slots, int id)
 {
 	int index = slots->id_to_index[id];
 	struct vmrun_memory_slot *slot;
@@ -2192,6 +2258,57 @@ id_to_memslot(struct vmrun_memslots *slots, int id)
 	WARN_ON(slot->id != id);
 
 	return slot;
+}
+
+/*
+ * search_memslots() and __gfn_to_memslot() are here because they are
+ * used in non-modular code in arch/powerpc/kvm/book3s_hv_rm_mmu.c.
+ * gfn_to_memslot() itself isn't here as an inline because that would
+ * bloat other code too much.
+ */
+static inline struct vmrun_memory_slot *
+vmrun_search_memslots(struct vmrun_memslots *slots, gfn_t gfn)
+{
+	int start = 0, end = slots->used_slots;
+	int slot = atomic_read(&slots->lru_slot);
+	struct vmrun_memory_slot *memslots = slots->memslots;
+
+	if (gfn >= memslots[slot].base_gfn &&
+	    gfn < memslots[slot].base_gfn + memslots[slot].npages)
+		return &memslots[slot];
+
+	while (start < end) {
+		slot = start + (end - start) / 2;
+
+		if (gfn >= memslots[slot].base_gfn)
+			end = slot;
+		else
+			start = slot + 1;
+	}
+
+	if (gfn >= memslots[start].base_gfn &&
+	    gfn < memslots[start].base_gfn + memslots[start].npages) {
+		atomic_set(&slots->lru_slot, start);
+		return &memslots[start];
+	}
+
+	return NULL;
+}
+
+static inline struct vmrun_memory_slot *
+__vmrun_gfn_to_memslot(struct vmrun_memslots *slots, gfn_t gfn)
+{
+	return vmrun_search_memslots(slots, gfn);
+}
+
+struct vmrun_memory_slot *vmrun_gfn_to_memslot(struct vmrun *vmrun, gfn_t gfn)
+{
+	return __vmrun_gfn_to_memslot(vmrun_memslots(vmrun), gfn);
+}
+
+struct vmrun_memory_slot *vmrun_vcpu_gfn_to_memslot(struct vmrun_vcpu *vcpu, gfn_t gfn)
+{
+	return __vmrun_gfn_to_memslot(vmrun_vcpu_memslots(vcpu), gfn);
 }
 
 /*
@@ -2263,18 +2380,6 @@ static int vmrun_check_memory_region_flags(const struct vmrun_userspace_memory_r
 	return 0;
 }
 
-static inline struct vmrun_memslots *__vmrun_memslots(struct vmrun *vmrun, int as_id)
-{
-	return srcu_dereference_check(vmrun->memslots[as_id], &vmrun->srcu,
-				      lockdep_is_held(&vmrun->slots_lock) ||
-				      !atomic_read(&vmrun->users_count));
-}
-
-static inline struct vmrun_memslots *vmrun_memslots(struct vmrun *vmrun)
-{
-	return __vmrun_memslots(vmrun, 0);
-}
-
 static struct vmrun_memslots *vmrun_install_new_memslots(struct vmrun *vmrun,
 						 int as_id, struct vmrun_memslots *slots)
 {
@@ -2311,11 +2416,6 @@ static struct vmrun_memslots *vmrun_install_new_memslots(struct vmrun *vmrun,
 
 	return old_memslots;
 }
-
-#define vmrun_for_each_memslot(memslot, slots)	\
-	for (memslot = &slots->memslots[0];	\
-	      memslot < slots->memslots + VMRUN_MEM_SLOTS_NUM && memslot->npages;\
-		memslot++)
 
 static struct vmrun_memslots *vmrun_alloc_memslots(void)
 {
@@ -2586,7 +2686,7 @@ int __vmrun_set_memory_region(struct vmrun *vmrun,
 	if (mem->guest_phys_addr + mem->memory_size < mem->guest_phys_addr)
 		goto out;
 
-	slot = id_to_memslot(__vmrun_memslots(vmrun, as_id), id);
+	slot = vmrun_id_to_memslot(__vmrun_memslots(vmrun, as_id), id);
 	base_gfn = mem->guest_phys_addr >> PAGE_SHIFT;
 	npages = mem->memory_size >> PAGE_SHIFT;
 
@@ -2666,7 +2766,7 @@ int __vmrun_set_memory_region(struct vmrun *vmrun,
 	memcpy(slots, __vmrun_memslots(vmrun, as_id), sizeof(struct vmrun_memslots));
 
 	if ((change == VMRUN_MR_DELETE) || (change == VMRUN_MR_MOVE)) {
-		slot = id_to_memslot(slots, id);
+		slot = vmrun_id_to_memslot(slots, id);
 		slot->flags |= VMRUN_MEMSLOT_INVALID;
 
 		old_memslots = vmrun_install_new_memslots(vmrun, as_id, slots);
@@ -2728,7 +2828,7 @@ int __vmrun_set_memory_region_vm_destroy(struct vmrun *vmrun, int id, gpa_t gpa,
 	if (WARN_ON(id >= VMRUN_MEM_SLOTS_NUM))
 		return -EINVAL;
 
-	slot = id_to_memslot(slots, id);
+	slot = vmrun_id_to_memslot(slots, id);
 
 	if (size) {
 		if (slot->npages)

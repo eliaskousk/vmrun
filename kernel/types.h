@@ -28,7 +28,4 @@ typedef u64            hfn_t;
 
 typedef hfn_t          vmrun_pfn_t;
 
-int vmrun_get_cpl(struct vmrun_vcpu *vcpu);
-unsigned long vmrun_get_rflags(struct vmrun_vcpu *vcpu);
-
 #endif //VMRUN_TYPES_H

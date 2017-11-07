@@ -248,16 +248,58 @@ union vmrun_mmu_page_role {
 		unsigned cr0_wp:1;
 		unsigned smep_andnot_wp:1;
 		unsigned smap_andnot_wp:1;
-		unsigned :8;
+		unsigned ad_disabled:1;
+		unsigned :7;
 
 		/*
 		 * This is left at the top of the word so that
-		 * vmrun_memslots_for_spte_role can extract it with a
+		 * kvm_memslots_for_spte_role can extract it with a
 		 * simple shift.  While there is room, give it a whole
 		 * byte so it is also faster to load it from memory.
 		 */
 		unsigned smm:8;
 	};
+};
+
+struct vmrun_rmap_head {
+	unsigned long val;
+};
+
+struct vmrun_mmu_page {
+	struct list_head link;
+	struct hlist_node hash_link;
+
+	/*
+	 * The following two entries are used to key the shadow page in the
+	 * hash table.
+	 */
+	gfn_t gfn;
+	union vmrun_mmu_page_role role;
+
+	u64 *spt;
+	/* hold the gfn of each spte inside spt */
+	gfn_t *gfns;
+	bool unsync;
+	int root_count;          /* Currently serving as active root */
+	unsigned int unsync_children;
+	struct vmrun_rmap_head parent_ptes; /* rmap pointers to parent sptes */
+
+	/* The page is obsolete if mmu_valid_gen != kvm->arch.mmu_valid_gen.  */
+	unsigned long mmu_valid_gen;
+
+	DECLARE_BITMAP(unsync_child_bitmap, 512);
+
+	/* Number of writes since the last time traversal visited this page.  */
+	atomic_t write_flooding_count;
+};
+
+struct x86_exception {
+	u8 vector;
+	bool error_code_valid;
+	u16 error_code;
+	bool nested_page_fault;
+	u64 address; /* cr2 or nested page fault gpa */
+	u8 async_page_fault;
 };
 
 struct vmrun_mmu {
@@ -351,10 +393,6 @@ struct vmrun_vcpu {
 
 	struct vmrun_mmu mmu;
 	struct list_head free_pages;
-};
-
-struct vmrun_rmap_head {
-	unsigned long val;
 };
 
 struct vmrun_lpage_info {

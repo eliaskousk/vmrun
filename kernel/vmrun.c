@@ -76,6 +76,7 @@
 #include <linux/types.h>
 #include <linux/context_tracking.h>
 #include <asm/desc.h>
+#include <asm/processor-flags.h>
 #include <asm/virtext.h>
 #include <asm/svm.h>
 
@@ -761,7 +762,7 @@ void vmrun_get_cs_db_l_bits(struct vmrun_vcpu *vcpu, int *db, int *l)
 	*l = cs.l;
 }
 
-static inline bool vmrun_is_protmode(struct kvm_vcpu *vcpu)
+static inline bool vmrun_is_protmode(struct vmrun_vcpu *vcpu)
 {
 	return vmrun_read_cr0_bits(vcpu, X86_CR0_PE);
 }
@@ -783,22 +784,25 @@ static inline bool vmrun_is_64_bit_mode(struct vmrun_vcpu *vcpu)
 	return cs_l;
 }
 
-static inline bool vmrun_is_la57_mode(struct vmrun_vcpu *vcpu)
-{
-	return (vcpu->efer & EFER_LMA) && vmrun_read_cr4_bits(vcpu, X86_CR4_LA57);
-}
+//
+// Linux v.4.13+
+//
+//static inline bool vmrun_is_la57_mode(struct vmrun_vcpu *vcpu)
+//{
+//	return (vcpu->efer & EFER_LMA) && vmrun_read_cr4_bits(vcpu, X86_CR4_LA57);
+//}
 
-static inline int is_pae(struct kvm_vcpu *vcpu)
+static inline int is_pae(struct vmrun_vcpu *vcpu)
 {
 	return vmrun_read_cr4_bits(vcpu, X86_CR4_PAE);
 }
 
-static inline int is_pse(struct kvm_vcpu *vcpu)
+static inline int is_pse(struct vmrun_vcpu *vcpu)
 {
 	return vmrun_read_cr4_bits(vcpu, X86_CR4_PSE);
 }
 
-static inline int is_paging(struct kvm_vcpu *vcpu)
+static inline int is_paging(struct vmrun_vcpu *vcpu)
 {
 	return likely(vmrun_read_cr0_bits(vcpu, X86_CR0_PG));
 }
@@ -2230,9 +2234,9 @@ vcpu_decrement:
 
 static inline struct vmrun_memslots *__vmrun_memslots(struct vmrun *vmrun, int as_id)
 {
-	return srcu_dereference_check(vmrun->memslots[as_id], &kvm->srcu,
-				      lockdep_is_held(&kvm->slots_lock) ||
-				      !refcount_read(&kvm->users_count));
+	return srcu_dereference_check(vmrun->memslots[as_id], &vmrun->srcu,
+				      lockdep_is_held(&vmrun->slots_lock) ||
+				      !refcount_read(&vmrun->users_count));
 }
 
 static inline struct vmrun_memslots *vmrun_memslots(struct vmrun *vmrun)
@@ -2428,7 +2432,7 @@ static struct vmrun_memslots *vmrun_alloc_memslots(void)
 		return NULL;
 
 	/*
-	 * Init kvm generation close to the maximum to easily test the
+	 * Init vmrun generation close to the maximum to easily test the
 	 * code of handling generation number wrap-around.
 	 */
 	// slots->generation = -150;
@@ -3037,6 +3041,511 @@ void vmrun_flush_remote_tlbs(struct vmrun *vmrun)
 //		++vmrun->stat.remote_tlb_flush;
 
 	cmpxchg(&vmrun->tlbs_dirty, dirty_count, 0);
+}
+
+struct vmrun_memory_slot *vmrun_gfn_to_memslot(struct vmrun *vmrun, gfn_t gfn)
+{
+	return __vmrun_gfn_to_memslot(vmrun_memslots(vmrun), gfn);
+}
+
+struct vmrun_memory_slot *vmrun_vcpu_gfn_to_memslot(struct vmrun_vcpu *vcpu, gfn_t gfn)
+{
+	return __vmrun_gfn_to_memslot(vmrun_vcpu_memslots(vcpu), gfn);
+}
+
+bool vmrun_is_visible_gfn(struct vmrun *vmrun, gfn_t gfn)
+{
+	struct vmrun_memory_slot *memslot = vmrun_gfn_to_memslot(vmrun, gfn);
+
+	if (!memslot || memslot->id >= VMRUN_USER_MEM_SLOTS ||
+	    memslot->flags & VMRUN_MEMSLOT_INVALID)
+		return false;
+
+	return true;
+}
+
+unsigned long vmrun_host_page_size(struct vmrun *vmrun, gfn_t gfn)
+{
+	struct vm_area_struct *vma;
+	unsigned long addr, size;
+
+	size = PAGE_SIZE;
+
+	addr = gfn_to_hva(vmrun, gfn);
+	if (vmrun_is_error_hva(addr))
+		return PAGE_SIZE;
+
+	down_read(&current->mm->mmap_sem);
+	vma = find_vma(current->mm, addr);
+	if (!vma)
+		goto out;
+
+	size = vma_kernel_pagesize(vma);
+
+	out:
+	up_read(&current->mm->mmap_sem);
+
+	return size;
+}
+
+static bool vmrun_memslot_is_readonly(struct vmrun_memory_slot *slot)
+{
+	return slot->flags & VMRUN_MEM_READONLY;
+}
+
+static unsigned long __vmrun_gfn_to_hva_many(struct vmrun_memory_slot *slot, gfn_t gfn,
+				       gfn_t *nr_pages, bool write)
+{
+	if (!slot || slot->flags & VMRUN_MEMSLOT_INVALID)
+		return VMRUN_HVA_ERR_BAD;
+
+	if (vmrun_memslot_is_readonly(slot) && write)
+		return VMRUN_HVA_ERR_RO_BAD;
+
+	if (nr_pages)
+		*nr_pages = slot->npages - (gfn - slot->base_gfn);
+
+	return __vmrun_gfn_to_hva_memslot(slot, gfn);
+}
+
+static unsigned long vmrun_gfn_to_hva_many(struct vmrun_memory_slot *slot, gfn_t gfn,
+				     gfn_t *nr_pages)
+{
+	return __vmrun_gfn_to_hva_many(slot, gfn, nr_pages, true);
+}
+
+unsigned long vmrun_gfn_to_hva_memslot(struct vmrun_memory_slot *slot,
+				 gfn_t gfn)
+{
+	return vmrun_gfn_to_hva_many(slot, gfn, NULL);
+}
+
+unsigned long vmrun_gfn_to_hva(struct vmrun *vmrun, gfn_t gfn)
+{
+	return vmrun_gfn_to_hva_many(vmrun_gfn_to_memslot(vmrun, gfn), gfn, NULL);
+}
+
+unsigned long vmrun_vcpu_gfn_to_hva(struct vmrun_vcpu *vcpu, gfn_t gfn)
+{
+	return vmrun_gfn_to_hva_many(vmrun_vcpu_gfn_to_memslot(vcpu, gfn), gfn, NULL);
+}
+
+/*
+ * If writable is set to false, the hva returned by this function is only
+ * allowed to be read.
+ */
+unsigned long vmrun_gfn_to_hva_memslot_prot(struct vmrun_memory_slot *slot,
+				            gfn_t gfn, bool *writable)
+{
+	unsigned long hva = __vmrun_gfn_to_hva_many(slot, gfn, NULL, false);
+
+	if (!vmrun_is_error_hva(hva) && writable)
+		*writable = !vmrun_memslot_is_readonly(slot);
+
+	return hva;
+}
+
+unsigned long vmrun_gfn_to_hva_prot(struct vmrun *vmrun, gfn_t gfn, bool *writable)
+{
+	struct vmrun_memory_slot *slot = vmrun_gfn_to_memslot(vmrun, gfn);
+
+	return vmrun_gfn_to_hva_memslot_prot(slot, gfn, writable);
+}
+
+unsigned long vmrun_vcpu_gfn_to_hva_prot(struct vmrun_vcpu *vcpu, gfn_t gfn, bool *writable)
+{
+	struct vmrun_memory_slot *slot = vmrun_vcpu_gfn_to_memslot(vcpu, gfn);
+
+	return vmrun_gfn_to_hva_memslot_prot(slot, gfn, writable);
+}
+
+static int vmrun_get_user_page_nowait(unsigned long start, int write,
+				      struct page **page)
+{
+	int flags = FOLL_NOWAIT | FOLL_HWPOISON;
+
+	if (write)
+		flags |= FOLL_WRITE;
+
+	return get_user_pages(start, 1, flags, page, NULL);
+}
+
+static inline int vmrun_check_user_page_hwpoison(unsigned long addr)
+{
+	int rc, flags = FOLL_HWPOISON | FOLL_WRITE;
+
+	rc = get_user_pages(addr, 1, flags, NULL, NULL);
+
+	return rc == -EHWPOISON;
+}
+
+/*
+ * The atomic path to get the writable pfn which will be stored in @pfn,
+ * true indicates success, otherwise false is returned.
+ */
+static bool vmrun_hva_to_pfn_fast(unsigned long addr, bool atomic, bool *async,
+			          bool write_fault, bool *writable, vmrun_pfn_t *pfn)
+{
+	struct page *page[1];
+	int npages;
+
+	if (!(async || atomic))
+		return false;
+
+	/*
+	 * Fast pin a writable pfn only if it is a write fault request
+	 * or the caller allows to map a writable pfn for a read fault
+	 * request.
+	 */
+	if (!(write_fault || writable))
+		return false;
+
+	npages = __get_user_pages_fast(addr, 1, 1, page);
+	if (npages == 1) {
+		*pfn = page_to_pfn(page[0]);
+
+		if (writable)
+			*writable = true;
+		return true;
+	}
+
+	return false;
+}
+
+/*
+ * The slow path to get the pfn of the specified host virtual address,
+ * 1 indicates success, -errno is returned if error is detected.
+ */
+static int vmrun_hva_to_pfn_slow(unsigned long addr, bool *async, bool write_fault,
+				 bool *writable, vmrun_pfn_t *pfn)
+{
+	struct page *page[1];
+	int npages = 0;
+
+	might_sleep();
+
+	if (writable)
+		*writable = write_fault;
+
+	if (async) {
+		down_read(&current->mm->mmap_sem);
+		npages = vmrun_get_user_page_nowait(addr, write_fault, page);
+		up_read(&current->mm->mmap_sem);
+	} else {
+		unsigned int flags = FOLL_HWPOISON;
+
+		if (write_fault)
+			flags |= FOLL_WRITE;
+
+		npages = get_user_pages_unlocked(addr, 1, page, flags);
+	}
+	if (npages != 1)
+		return npages;
+
+	/* map read fault as writable if possible */
+	if (unlikely(!write_fault) && writable) {
+		struct page *wpage[1];
+
+		npages = __get_user_pages_fast(addr, 1, 1, wpage);
+		if (npages == 1) {
+			*writable = true;
+			put_page(page[0]);
+			page[0] = wpage[0];
+		}
+
+		npages = 1;
+	}
+	*pfn = page_to_pfn(page[0]);
+	return npages;
+}
+
+static bool vmrun_vma_is_valid(struct vm_area_struct *vma, bool write_fault)
+{
+	if (unlikely(!(vma->vm_flags & VM_READ)))
+		return false;
+
+	if (write_fault && (unlikely(!(vma->vm_flags & VM_WRITE))))
+		return false;
+
+	return true;
+}
+
+static int vmrun_hva_to_pfn_remapped(struct vm_area_struct *vma,
+			             unsigned long addr, bool *async,
+			             bool write_fault, vmrun_pfn_t *p_pfn)
+{
+	unsigned long pfn;
+	int r;
+
+	r = follow_pfn(vma, addr, &pfn);
+
+	if (r) {
+		/*
+		 * get_user_pages fails for VM_IO and VM_PFNMAP vmas and does
+		 * not call the fault handler, so do it here.
+		 */
+		bool unlocked = false;
+
+		r = fixup_user_fault(current, current->mm, addr,
+				     (write_fault ? FAULT_FLAG_WRITE : 0),
+				     &unlocked);
+
+		if (unlocked)
+			return -EAGAIN;
+
+		if (r)
+			return r;
+
+		r = follow_pfn(vma, addr, &pfn);
+
+		if (r)
+			return r;
+
+	}
+
+	/*
+	 * Get a reference here because callers of *hva_to_pfn* and
+	 * *gfn_to_pfn* ultimately call vmrun_release_pfn_clean on the
+	 * returned pfn.  This is only needed if the VMA has VM_MIXEDMAP
+	 * set, but the vmrun_get_pfn/vmrun_release_pfn_clean pair will
+	 * simply do nothing for reserved pfns.
+	 *
+	 * Whoever called remap_pfn_range is also going to call e.g.
+	 * unmap_mapping_range before the underlying pages are freed,
+	 * causing a call to our MMU notifier.
+	 */
+	vmrun_get_pfn(pfn);
+
+	*p_pfn = pfn;
+	return 0;
+}
+
+/*
+ * Pin guest page in memory and return its pfn.
+ * @addr: host virtual address which maps memory to the guest
+ * @atomic: whether this function can sleep
+ * @async: whether this function need to wait IO complete if the
+ *         host page is not in the memory
+ * @write_fault: whether we should get a writable host page
+ * @writable: whether it allows to map a writable host page for !@write_fault
+ *
+ * The function will map a writable host page for these two cases:
+ * 1): @write_fault = true
+ * 2): @write_fault = false && @writable, @writable will tell the caller
+ *     whether the mapping is writable.
+ */
+static vmrun_pfn_t vmrun_hva_to_pfn(unsigned long addr, bool atomic, bool *async,
+			            bool write_fault, bool *writable)
+{
+	struct vm_area_struct *vma;
+	vmrun_pfn_t pfn = 0;
+	int npages, r;
+
+	/* we can do it either atomically or asynchronously, not both */
+	BUG_ON(atomic && async);
+
+	if (vmrun_hva_to_pfn_fast(addr, atomic, async, write_fault, writable, &pfn))
+		return pfn;
+
+	if (atomic)
+		return VMRUN_PFN_ERR_FAULT;
+
+	npages = vmrun_hva_to_pfn_slow(addr, async, write_fault, writable, &pfn);
+
+	if (npages == 1)
+		return pfn;
+
+	down_read(&current->mm->mmap_sem);
+
+	if (npages == -EHWPOISON ||
+	    (!async && vmrun_check_user_page_hwpoison(addr))) {
+		pfn = VMRUN_PFN_ERR_HWPOISON;
+		goto exit;
+	}
+
+retry:
+	vma = find_vma_intersection(current->mm, addr, addr + 1);
+
+	if (vma == NULL)
+		pfn = VMRUN_PFN_ERR_FAULT;
+	else if (vma->vm_flags & (VM_IO | VM_PFNMAP)) {
+		r = vmrun_hva_to_pfn_remapped(vma, addr, async, write_fault, &pfn);
+		if (r == -EAGAIN)
+			goto retry;
+		if (r < 0)
+			pfn = VMRUN_PFN_ERR_FAULT;
+	} else {
+		if (async && vmrun_vma_is_valid(vma, write_fault))
+			*async = true;
+		pfn = VMRUN_PFN_ERR_FAULT;
+	}
+
+exit:
+	up_read(&current->mm->mmap_sem);
+
+	return pfn;
+}
+
+vmrun_pfn_t __vmrun_gfn_to_pfn_memslot(struct vmrun_memory_slot *slot, gfn_t gfn,
+			               bool atomic, bool *async, bool write_fault,
+			               bool *writable)
+{
+	unsigned long addr = __vmrun_gfn_to_hva_many(slot, gfn, NULL, write_fault);
+
+	if (addr == VMRUN_HVA_ERR_RO_BAD) {
+		if (writable)
+			*writable = false;
+
+		return VMRUN_PFN_ERR_RO_FAULT;
+	}
+
+	if (vmrun_is_error_hva(addr)) {
+		if (writable)
+			*writable = false;
+
+		return VMRUN_PFN_NOSLOT;
+	}
+
+	/* Do not map writable pfn in the readonly memslot. */
+	if (writable && vmrun_memslot_is_readonly(slot)) {
+		*writable = false;
+		writable = NULL;
+	}
+
+	return vmrun_hva_to_pfn(addr, atomic, async, write_fault, writable);
+}
+
+vmrun_pfn_t vmrun_gfn_to_pfn_prot(struct vmrun *vmrun, gfn_t gfn, bool write_fault,
+			  bool *writable)
+{
+	return __vmrun_gfn_to_pfn_memslot(vmrun_gfn_to_memslot(vmrun, gfn), gfn, false, NULL,
+				    write_fault, writable);
+}
+
+vmrun_pfn_t vmrun_gfn_to_pfn_memslot(struct vmrun_memory_slot *slot, gfn_t gfn)
+{
+	return __vmrun_gfn_to_pfn_memslot(slot, gfn, false, NULL, true, NULL);
+}
+
+vmrun_pfn_t vmrun_gfn_to_pfn_memslot_atomic(struct vmrun_memory_slot *slot, gfn_t gfn)
+{
+	return __vmrun_gfn_to_pfn_memslot(slot, gfn, true, NULL, true, NULL);
+}
+
+vmrun_pfn_t vmrun_gfn_to_pfn_atomic(struct vmrun *vmrun, gfn_t gfn)
+{
+	return vmrun_gfn_to_pfn_memslot_atomic(vmrun_gfn_to_memslot(vmrun, gfn), gfn);
+}
+
+vmrun_pfn_t vmrun_vcpu_gfn_to_pfn_atomic(struct vmrun_vcpu *vcpu, gfn_t gfn)
+{
+	return vmrun_gfn_to_pfn_memslot_atomic(vmrun_vcpu_gfn_to_memslot(vcpu, gfn), gfn);
+}
+
+vmrun_pfn_t gfn_to_pfn(struct vmrun *vmrun, gfn_t gfn)
+{
+	return vmrun_gfn_to_pfn_memslot(vmrun_gfn_to_memslot(vmrun, gfn), gfn);
+}
+
+vmrun_pfn_t vmrun_vcpu_gfn_to_pfn(struct vmrun_vcpu *vcpu, gfn_t gfn)
+{
+	return vmrun_gfn_to_pfn_memslot(vmrun_vcpu_gfn_to_memslot(vcpu, gfn), gfn);
+}
+
+int vmrun_gfn_to_page_many_atomic(struct vmrun_memory_slot *slot, gfn_t gfn,
+			          struct page **pages, int nr_pages)
+{
+	unsigned long addr;
+	gfn_t entry = 0;
+
+	addr = vmrun_gfn_to_hva_many(slot, gfn, &entry);
+
+	if (vmrun_is_error_hva(addr))
+		return -1;
+
+	if (entry < nr_pages)
+		return 0;
+
+	return __get_user_pages_fast(addr, nr_pages, 1, pages);
+}
+
+static struct page *vmrun_pfn_to_page(vmrun_pfn_t pfn)
+{
+	if (is_error_noslot_pfn(pfn))
+		return VMRUN_ERR_PTR_BAD_PAGE;
+
+	if (vmrun_is_reserved_pfn(pfn)) {
+		WARN_ON(1);
+		return VMRUN_ERR_PTR_BAD_PAGE;
+	}
+
+	return pfn_to_page(pfn);
+}
+
+struct page *vmrun_gfn_to_page(struct vmrun *vmrun, gfn_t gfn)
+{
+	vmrun_pfn_t pfn;
+
+	pfn = gfn_to_pfn(vmrun, gfn);
+
+	return vmrun_pfn_to_page(pfn);
+}
+
+struct page *vmrun_vcpu_gfn_to_page(struct vmrun_vcpu *vcpu, gfn_t gfn)
+{
+	vmrun_pfn_t pfn;
+
+	pfn = vmrun_vcpu_gfn_to_pfn(vcpu, gfn);
+
+	return vmrun_pfn_to_page(pfn);
+}
+
+void vmrun_release_page_clean(struct page *page)
+{
+	WARN_ON(is_error_page(page));
+
+	vmrun_release_pfn_clean(page_to_pfn(page));
+}
+
+void vmrun_release_pfn_clean(vmrun_pfn_t pfn)
+{
+	if (!is_error_noslot_pfn(pfn) && !vmrun_is_reserved_pfn(pfn))
+		put_page(pfn_to_page(pfn));
+}
+
+void vmrun_release_page_dirty(struct page *page)
+{
+	WARN_ON(is_error_page(page));
+
+	vmrun_release_pfn_dirty(page_to_pfn(page));
+}
+
+static void vmrun_release_pfn_dirty(vmrun_pfn_t pfn)
+{
+	vmrun_set_pfn_dirty(pfn);
+	vmrun_release_pfn_clean(pfn);
+}
+
+void vmrun_set_pfn_dirty(vmrun_pfn_t pfn)
+{
+	if (!vmrun_is_reserved_pfn(pfn)) {
+		struct page *page = pfn_to_page(pfn);
+
+		if (!PageReserved(page))
+			SetPageDirty(page);
+	}
+}
+
+void vmrun_set_pfn_accessed(vmrun_pfn_t pfn)
+{
+	if (!vmrun_is_reserved_pfn(pfn))
+		mark_page_accessed(pfn_to_page(pfn));
+}
+
+void vmrun_get_pfn(vmrun_pfn_t pfn)
+{
+	if (!vmrun_is_reserved_pfn(pfn))
+		get_page(pfn_to_page(pfn));
 }
 
 static inline struct vmrun *mmu_notifier_to_vmrun(struct mmu_notifier *mn)
